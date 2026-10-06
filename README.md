@@ -5,8 +5,9 @@ Run a thing while its moment lasts, and let it go once the moment has passed.
 *Shiodoki* (潮時) is the turn of the tide: the moment to act, and -- as the
 word is more often used -- the moment after which there is no point.
 
-> **Status:** nothing here is implemented yet. This README is the
-> specification it is being built to.
+> **Status:** the decision and the commands are done; the agent that runs
+> them is not. Until it is, rules do not run on their own. This README is
+> the specification it is being built to.
 
 ## Why
 
@@ -193,8 +194,14 @@ shiodoki block 2026-10-15 --rule retro   # one rule, the whole day
 ```
 
 Dates are written `2026-10-15`, `today`, `tomorrow`, or a weekday name for
-the nearest one, today included. `unskip` and `unblock` take the same
-arguments and undo them.
+the nearest one, today included. `--next` is the period now open if the rule
+has not run in it yet -- the meeting you are about to miss -- and the one
+after otherwise.
+
+`unskip` takes the same days, `--next` (the next skipped period) or `--until`;
+with none of them it takes back every skip of the rule. `unblock` removes the
+blocks overlapping a day or a stretch of one (`--rule` narrows it to blocks
+naming exactly those rules), or every block with `--all`.
 
 `overrides.toml` is plain TOML in local time, for reading and editing by
 hand as much as for the commands:
@@ -233,15 +240,30 @@ minimal one. Give full paths, or set `PATH` and anything else under `[env]`.
 
 | Command | What it does |
 |---|---|
-| `shiodoki agent` | The resident process: the icon, the events and the clock. What the login item starts |
+| `shiodoki-agent` | The resident process: the icon, the events and the clock. What the login item starts. *Not yet* |
 | `shiodoki status` | Whether the agent is running or paused, which rules are due and waiting, and the next periods with skips and blocks applied |
 | `shiodoki pause` / `resume` | See [Holding back](#holding-back) |
 | `shiodoki skip` / `unskip` | See [Holding back](#holding-back) |
 | `shiodoki block` / `unblock` | See [Holding back](#holding-back) |
 | `shiodoki check` | Read the configuration and report what is wrong with it, without the agent |
-| `shiodoki try ID` | Run a rule's command now, ignoring its schedule, to see that it works |
-| `shiodoki fire EVENT [--ssid NAME]` | Hand the running agent an event as if the OS had sent it |
-| `shiodoki install` / `uninstall` | Add or remove the login item |
+| `shiodoki try ID` | Run a rule's command now, ignoring its schedule, to see that it works. It runs in the foreground, with its output in the terminal, and `try` waits for it to exit |
+| `shiodoki fire EVENT [--ssid NAME]` | Hand the running agent an event as if the OS had sent it. *Not yet* |
+| `shiodoki install` / `uninstall` | Add or remove the login item. *Not yet* |
+
+The agent is a program of its own rather than a `shiodoki` subcommand
+because on Windows a program is either a console program or a window
+program, decided when it is built. The commands need the console to print
+to; the agent must not open one at every login.
+
+```
+$ shiodoki status
+agent    running (seen Tue 10-13 10:05)
+pause    not paused
+waiting  weekly-review    Tue 10-13 10:00-10:20
+next     Thu 10-15 15:00-15:15  retro  (skipped)
+         Tue 10-20 10:00-10:20  weekly-review
+skips    retro            2026-10-15
+```
 
 The agent reads the configuration again whenever it or `overrides.toml`
 changes. A configuration with an error is reported -- on the icon and in the
@@ -267,14 +289,16 @@ back are due as usual; events in between are not seen.
 | | macOS | Windows |
 |---|---|---|
 | `config.toml`, `overrides.toml` | `~/.config/shiodoki/` (`$XDG_CONFIG_HOME`) | `%APPDATA%\shiodoki\` |
-| `state.json`, `shiodoki.log` | `~/.local/state/shiodoki/` (`$XDG_STATE_HOME`) | `%LOCALAPPDATA%\shiodoki\` |
+| `state.json`, `pause`, `heartbeat`, `shiodoki.log` | `~/.local/state/shiodoki/` (`$XDG_STATE_HOME`) | `%LOCALAPPDATA%\shiodoki\` |
 
 `--config PATH`, or `SHIODOKI_CONFIG`, puts the configuration somewhere else
 -- a synced folder, for one. `shiodoki install --config PATH` writes that
 path into the login item, which does not see your environment.
 `overrides.toml` always lives next to the configuration it overrides.
+`SHIODOKI_STATE` moves the state directory in the same way.
 
-The state is this machine's record of what ran, what is due, and the pause.
+The state is this machine's record of what ran, what is due, the pause, and
+when the agent was last seen.
 It is never meant to be synced. Two machines sharing a configuration each run
 its rules on their own; there is no coordination between them.
 
@@ -290,7 +314,7 @@ shiodoki install
 On macOS, `install` writes a LaunchAgent that starts the agent at login and
 starts it again only if it crashes, so Quit stays quit. On Windows it puts a
 shortcut to the installed binary in the Startup folder. Log out and back in,
-or run `shiodoki agent` once by hand.
+or run `shiodoki-agent` once by hand.
 
 ## Platform notes
 

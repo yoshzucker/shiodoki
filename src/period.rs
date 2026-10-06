@@ -31,7 +31,8 @@ impl Period {
 const HORIZON: usize = 1000;
 
 impl Rule {
-    fn falls_on(&self, d: Date) -> bool {
+    /// Whether the rule has a period on `d`.
+    pub fn falls_on(&self, d: Date) -> bool {
         !self.except.contains(&d) && !self.schedule.between(d, d).is_empty()
     }
 
@@ -52,7 +53,7 @@ impl Rule {
     }
 
     /// The period on `day`, which the caller knows the rule falls on.
-    fn period_on(&self, day: Date, ds: DayStart, tz: &TimeZone) -> Period {
+    pub fn period_on(&self, day: Date, ds: DayStart, tz: &TimeZone) -> Period {
         let start = self.opening(day, ds, tz);
         let natural = match self.until {
             Some(Until::At(t)) => next_reading(start, t, tz),

@@ -19,7 +19,7 @@ use jiff::civil::{Date, DateTime};
 use jiff::tz::TimeZone;
 use toml::{Table, Value};
 
-use crate::clock::local;
+use crate::clock::{add_days, local};
 use crate::config::{RuleId, date_value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +61,78 @@ impl Overrides {
     pub fn prune(&mut self, now: Timestamp, today: Date) {
         self.skips.retain(|s| s.to >= today);
         self.blocks.retain(|b| b.to > now);
+    }
+
+    /// Skip `rule` from `from` to `to`, merged with the skips of it that
+    /// overlap or touch, so the file says each thing once.
+    pub fn add_skip(&mut self, rule: &str, from: Date, to: Date) {
+        let (mut from, mut to) = (from, to);
+        self.skips.retain(|s| {
+            let touches = s.rule == rule && add_days(s.from, -1) <= to && from <= add_days(s.to, 1);
+            if touches {
+                from = from.min(s.from);
+                to = to.max(s.to);
+            }
+            !touches
+        });
+        self.skips.push(Skip {
+            rule: rule.to_string(),
+            from,
+            to,
+        });
+        self.skips
+            .sort_by(|a, b| (&a.rule, a.from).cmp(&(&b.rule, b.from)));
+    }
+
+    /// Take `from..=to` out of `rule`'s skips, splitting a skip that runs
+    /// across it.  Whether anything changed.
+    pub fn remove_skip(&mut self, rule: &str, from: Date, to: Date) -> bool {
+        let before = self.skips.clone();
+        let mut kept = vec![];
+        for s in self.skips.drain(..) {
+            if s.rule != rule || s.to < from || to < s.from {
+                kept.push(s);
+                continue;
+            }
+            if s.from < from {
+                kept.push(Skip {
+                    rule: s.rule.clone(),
+                    from: s.from,
+                    to: add_days(from, -1),
+                });
+            }
+            if to < s.to {
+                kept.push(Skip {
+                    rule: s.rule.clone(),
+                    from: add_days(to, 1),
+                    to: s.to,
+                });
+            }
+        }
+        self.skips = kept;
+        self.skips
+            .sort_by(|a, b| (&a.rule, a.from).cmp(&(&b.rule, b.from)));
+        self.skips != before
+    }
+
+    /// Remove the blocks that overlap `window` (every block when `None`)
+    /// and, when `rules` is not empty, name exactly those rules.  How many.
+    pub fn remove_blocks(
+        &mut self,
+        window: Option<(Timestamp, Timestamp)>,
+        rules: &[RuleId],
+    ) -> usize {
+        let mut wanted: Vec<&RuleId> = rules.iter().collect();
+        wanted.sort();
+        let n = self.blocks.len();
+        self.blocks.retain(|b| {
+            let overlaps = window.is_none_or(|(from, to)| b.from < to && from < b.to);
+            let mut named: Vec<&RuleId> = b.rules.iter().collect();
+            named.sort();
+            let same = rules.is_empty() || named == wanted;
+            !(overlaps && same)
+        });
+        n - self.blocks.len()
     }
 
     pub fn parse(text: &str, tz: &TimeZone) -> Result<Overrides, Vec<String>> {
@@ -312,6 +384,76 @@ mod tests {
         o.prune(at(date(2026, 10, 7), 10, 0), date(2026, 10, 7));
         assert_eq!(o.skips.len(), 1);
         assert_eq!(o.blocks.len(), 1);
+    }
+
+    #[test]
+    fn skips_merge_and_split() {
+        let mut o = Overrides::default();
+        o.add_skip("a", date(2026, 10, 13), date(2026, 10, 13));
+        o.add_skip("a", date(2026, 10, 14), date(2026, 10, 16));
+        o.add_skip("a", date(2026, 10, 20), date(2026, 10, 20));
+        o.add_skip("b", date(2026, 10, 15), date(2026, 10, 15));
+        let ranges = |o: &Overrides| -> Vec<(String, Date, Date)> {
+            o.skips
+                .iter()
+                .map(|s| (s.rule.clone(), s.from, s.to))
+                .collect()
+        };
+        assert_eq!(
+            ranges(&o),
+            vec![
+                ("a".into(), date(2026, 10, 13), date(2026, 10, 16)),
+                ("a".into(), date(2026, 10, 20), date(2026, 10, 20)),
+                ("b".into(), date(2026, 10, 15), date(2026, 10, 15)),
+            ]
+        );
+        assert!(o.remove_skip("a", date(2026, 10, 14), date(2026, 10, 14)));
+        assert!(!o.remove_skip("a", date(2026, 10, 18), date(2026, 10, 19)));
+        assert_eq!(
+            ranges(&o),
+            vec![
+                ("a".into(), date(2026, 10, 13), date(2026, 10, 13)),
+                ("a".into(), date(2026, 10, 15), date(2026, 10, 16)),
+                ("a".into(), date(2026, 10, 20), date(2026, 10, 20)),
+                ("b".into(), date(2026, 10, 15), date(2026, 10, 15)),
+            ]
+        );
+    }
+
+    #[test]
+    fn blocks_are_removed_by_overlap_and_rules() {
+        let at = |d: Date, h, m| local(d.at(h, m, 0, 0), &tz());
+        let day = date(2026, 10, 15);
+        let mut o = Overrides {
+            skips: vec![],
+            blocks: vec![
+                Block {
+                    from: at(day, 13, 0),
+                    to: at(day, 15, 0),
+                    rules: vec![],
+                },
+                Block {
+                    from: at(day, 13, 0),
+                    to: at(day, 15, 0),
+                    rules: vec!["a".into()],
+                },
+                Block {
+                    from: at(day, 18, 0),
+                    to: at(day, 19, 0),
+                    rules: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            o.remove_blocks(Some((at(day, 14, 0), at(day, 14, 30))), &["a".into()]),
+            1
+        );
+        assert_eq!(
+            o.remove_blocks(Some((at(day, 15, 0), at(day, 18, 0))), &[]),
+            0,
+            "touching is not overlapping"
+        );
+        assert_eq!(o.remove_blocks(None, &[]), 2);
     }
 
     #[test]
