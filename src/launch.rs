@@ -49,8 +49,11 @@ fn spawn(
     name: &str,
 ) -> Result<Started, String> {
     c.envs(env).stdin(Stdio::null());
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        c.current_dir(home);
+    // On Windows, HOME is whatever a POSIX shell such as MSYS2's set it to
+    // -- `/home/you`, which Windows cannot start a process in.
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if let Some(dir) = std::env::var_os(home).filter(|d| std::path::Path::new(d).is_dir()) {
+        c.current_dir(dir);
     }
     if let Output::Log(path) = out {
         let log = OpenOptions::new()
