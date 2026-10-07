@@ -305,7 +305,7 @@ back are due as usual; events in between are not seen.
 
 | | macOS | Windows |
 |---|---|---|
-| `config.toml`, `overrides.toml` | `~/.config/shiodoki/` (`$XDG_CONFIG_HOME`) | `%APPDATA%\shiodoki\` |
+| `config.toml`, `overrides.toml` | `~/.config/shiodoki/` (`$XDG_CONFIG_HOME`) | `%USERPROFILE%\.config\shiodoki\` (`%XDG_CONFIG_HOME%`) |
 | `state.json`, `pause`, `heartbeat`, `shiodoki.log` | `~/.local/state/shiodoki/` (`$XDG_STATE_HOME`) | `%LOCALAPPDATA%\shiodoki\` |
 
 Templates for both are in [`templates/`](templates/), and inside `shiodoki`

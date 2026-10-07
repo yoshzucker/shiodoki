@@ -77,27 +77,34 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// On Windows, USERPROFILE: HOME there is whatever a POSIX shell such as
+/// MSYS2's set it to -- `/home/you` -- and the agent, started at login, does
+/// not see it.
 fn home() -> Result<PathBuf, String> {
-    env_path("HOME")
-        .or_else(|| env_path("USERPROFILE"))
+    env_path(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .ok_or_else(|| "cannot tell where the home directory is".to_string())
 }
 
+/// An XDG base directory, ignored unless it is absolute, as the
+/// specification says.  On Windows that leaves out a POSIX path.
+fn xdg(name: &str) -> Option<PathBuf> {
+    env_path(name).filter(|p| p.is_absolute())
+}
+
+/// `~/.config/shiodoki` on Windows too: the configuration is a file a person
+/// edits, and keeps with the rest of their dotfiles.
 fn default_config_dir() -> Result<PathBuf, String> {
-    let base = if cfg!(windows) {
-        env_path("APPDATA").ok_or("APPDATA is not set")?
-    } else {
-        env_path("XDG_CONFIG_HOME").map_or_else(|| home().map(|h| h.join(".config")), Ok)?
-    };
+    let base = xdg("XDG_CONFIG_HOME").map_or_else(|| home().map(|h| h.join(".config")), Ok)?;
     Ok(base.join("shiodoki"))
 }
 
+/// The state is this machine's alone, so on Windows it stays in
+/// LOCALAPPDATA, which a roaming profile leaves behind.
 fn default_state_dir() -> Result<PathBuf, String> {
     let base = if cfg!(windows) {
         env_path("LOCALAPPDATA").ok_or("LOCALAPPDATA is not set")?
     } else {
-        env_path("XDG_STATE_HOME")
-            .map_or_else(|| home().map(|h| h.join(".local").join("state")), Ok)?
+        xdg("XDG_STATE_HOME").map_or_else(|| home().map(|h| h.join(".local").join("state")), Ok)?
     };
     Ok(base.join("shiodoki"))
 }
