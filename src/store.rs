@@ -7,6 +7,7 @@
 //! | `pause` | `pause`, `resume`, the icon | the agent, `status` |
 //! | `state.json` | the agent | `status`, `skip --next` |
 //! | `heartbeat` | the agent, each tick | `status` |
+//! | `inbox/*.event` | `fire` | the agent, which removes them |
 //!
 //! Every write goes to a temporary file that is then renamed over the old
 //! one, so a reader never sees half of one.
@@ -58,6 +59,11 @@ impl Paths {
 
     pub fn heartbeat(&self) -> PathBuf {
         self.state_dir.join("heartbeat")
+    }
+
+    /// Where `shiodoki fire` leaves events for the agent.
+    pub fn inbox(&self) -> PathBuf {
+        self.state_dir.join("inbox")
     }
 
     pub fn log(&self) -> PathBuf {

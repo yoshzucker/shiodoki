@@ -153,6 +153,32 @@ fn open(
     spawn(c, env, out, with.unwrap_or("xdg-open"))
 }
 
+/// Open a text file for editing: the default text editor on macOS, the
+/// file's own application on Windows (Notepad if it has none).
+pub fn edit(path: &std::path::Path) -> Result<(), String> {
+    let target = path.to_string_lossy().into_owned();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("/usr/bin/open")
+        .arg("-t")
+        .arg(&target)
+        .spawn()
+        .map(drop);
+    #[cfg(windows)]
+    let r = match open(&target, None, &BTreeMap::new(), &Output::Inherit) {
+        Ok(_) => Ok(()),
+        Err(_) => std::process::Command::new("notepad.exe")
+            .arg(&target)
+            .spawn()
+            .map(drop),
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let r = std::process::Command::new("xdg-open")
+        .arg(&target)
+        .spawn()
+        .map(drop);
+    r.map_err(|e| format!("could not open {target}: {e}"))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

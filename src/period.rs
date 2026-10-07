@@ -25,6 +25,23 @@ impl Period {
     pub fn contains(&self, t: Timestamp) -> bool {
         self.start <= t && t < self.end
     }
+
+    /// `Tue 10-13 10:00-10:20`, or `Tue 10-13 04:00 - Wed 10-14 04:00`.
+    pub fn display(&self, tz: &TimeZone) -> String {
+        let (a, b) = (
+            self.start.to_zoned(tz.clone()),
+            self.end.to_zoned(tz.clone()),
+        );
+        if a.date() == b.date() {
+            format!("{}-{}", a.strftime("%a %m-%d %H:%M"), b.strftime("%H:%M"))
+        } else {
+            format!(
+                "{} - {}",
+                a.strftime("%a %m-%d %H:%M"),
+                b.strftime("%a %m-%d %H:%M")
+            )
+        }
+    }
 }
 
 /// How far ahead to look for a rule's next day before giving up on it.

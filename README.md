@@ -5,9 +5,8 @@ Run a thing while its moment lasts, and let it go once the moment has passed.
 *Shiodoki* (潮時) is the turn of the tide: the moment to act, and -- as the
 word is more often used -- the moment after which there is no point.
 
-> **Status:** the decision and the commands are done; the agent that runs
-> them is not. Until it is, rules do not run on their own. This README is
-> the specification it is being built to.
+> **Status:** runs on macOS. The Windows side builds, but has not been run
+> on Windows yet.
 
 ## Why
 
@@ -240,15 +239,15 @@ minimal one. Give full paths, or set `PATH` and anything else under `[env]`.
 
 | Command | What it does |
 |---|---|
-| `shiodoki-agent` | The resident process: the icon, the events and the clock. What the login item starts. *Not yet* |
+| `shiodoki-agent [--config PATH]` | The resident process: the icon, the events and the clock. What the login item starts. A second one in the same state directory stops at once |
 | `shiodoki status` | Whether the agent is running or paused, which rules are due and waiting, and the next periods with skips and blocks applied |
 | `shiodoki pause` / `resume` | See [Holding back](#holding-back) |
 | `shiodoki skip` / `unskip` | See [Holding back](#holding-back) |
 | `shiodoki block` / `unblock` | See [Holding back](#holding-back) |
 | `shiodoki check` | Read the configuration and report what is wrong with it, without the agent |
 | `shiodoki try ID` | Run a rule's command now, ignoring its schedule, to see that it works. It runs in the foreground, with its output in the terminal, and `try` waits for it to exit |
-| `shiodoki fire EVENT [--ssid NAME]` | Hand the running agent an event as if the OS had sent it. *Not yet* |
-| `shiodoki install` / `uninstall` | Add or remove the login item. *Not yet* |
+| `shiodoki fire EVENT [--ssid NAME]` | Hand the running agent an event as if the OS had sent it: `login` (as a new session), `unlock`, `wake`, `network`. It is refused when no agent is running, rather than kept for one that starts later |
+| `shiodoki install` / `uninstall` | Add the login item and start the agent, or remove it and stop the agent |
 
 The agent is a program of its own rather than a `shiodoki` subcommand
 because on Windows a program is either a console program or a window
@@ -307,29 +306,44 @@ its rules on their own; there is no coordination between them.
 From a clone:
 
 ```sh
-cargo install --path .
+cargo install --path .     # shiodoki and shiodoki-agent, side by side
 shiodoki install
 ```
 
-On macOS, `install` writes a LaunchAgent that starts the agent at login and
-starts it again only if it crashes, so Quit stays quit. On Windows it puts a
-shortcut to the installed binary in the Startup folder. Log out and back in,
-or run `shiodoki-agent` once by hand.
+On macOS, `install` writes `~/Library/LaunchAgents/io.github.yoshzucker.shiodoki.plist`,
+which starts the agent at login and again only if it crashes, so Quit stays
+quit. On Windows it puts `shiodoki.lnk` in the Startup folder, pointing at
+`shiodoki-agent.exe` where it was installed. Either way it stops an agent
+already running and starts the new one, so running it again after
+installing a new build is how to switch to it. On Windows a running agent
+holds its executable open, so `shiodoki uninstall` -- or Quit from the icon
+-- comes before `cargo install` there.
+
+`shiodoki install --config PATH` writes that path into the login item; so
+does `SHIODOKI_CONFIG`, if it is set when `install` runs.
 
 ## Platform notes
+
+The agent does not subscribe to the OS's notifications. Every two seconds
+it asks three questions -- is the screen locked, which Wi-Fi network is
+this, which addresses are up -- and works out the events from how the
+answers change. That keeps what each OS has to provide small, and the part
+that decides the same on both. An unlock is heard within two seconds; a
+network change once the answers have held for three samples.
 
 | | macOS | Windows |
 |---|---|---|
 | Login item | LaunchAgent | Startup folder shortcut |
 | Icon | menu bar | notification area |
-| `unlock` | the screen-unlocked notification; fast user switching | session unlock; console reconnect |
-| `wake` | the workspace did-wake notification | power resume notification |
-| `network` | SystemConfiguration changes | network list and WLAN notifications |
-| `ssid` | Not yet -- macOS tells only an app bundle granted Location Services which Wi-Fi network it is on | On Windows 11 24H2 and later, needs *Let desktop apps access your location* (Settings > Privacy & security > Location). It is one switch for every desktop app |
-| Locked at start? | the current session's dictionary | the session's lock state from the Terminal Services API |
+| The session, for `login` | this user's console login, by its time | the session's number and logon time |
+| Locked? | the current session's dictionary (`CGSSessionScreenIsLocked`) | the session's flags from the Terminal Services API |
+| `wake` | the wall clock running ahead of the agent's own, which stops in sleep | the agent having been stopped for longer than a sample takes |
+| `network` | the interfaces that are up, and their IPv4 addresses | the same |
+| `ssid` | Not yet -- macOS tells only an app bundle granted Location Services which Wi-Fi network it is on | the WLAN API. On Windows 11 24H2 and later it needs *Let desktop apps access your location* (Settings > Privacy & security > Location), one switch for every desktop app; without it no network is known |
 
-On Windows the binary is built for the GUI subsystem, so neither the agent
-nor the commands it starts flash a console window.
+On Windows the agent is built as a window program, so starting it at login
+opens no console, and console programs it runs start without one unless the
+rule says `window = true`.
 
 ## Not yet
 

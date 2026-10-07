@@ -79,6 +79,18 @@ enum Cmd {
     },
     /// Run a rule's command now, ignoring its schedule
     Try { rule: String },
+    /// Hand the running agent an event, as if the OS had sent it
+    Fire {
+        /// login, unlock, wake or network
+        event: String,
+        /// With network: the Wi-Fi network joined
+        #[arg(long, value_name = "NAME")]
+        ssid: Option<String>,
+    },
+    /// Start the agent at every login, and now
+    Install,
+    /// Stop starting the agent at login, and stop it
+    Uninstall,
 }
 
 #[derive(clap::Args)]
@@ -121,6 +133,8 @@ fn which(days: Vec<String>, next: bool, until: Option<String>) -> Option<Which> 
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    let explicit_config =
+        args.config.is_some() || std::env::var_os("SHIODOKI_CONFIG").is_some_and(|v| !v.is_empty());
     let paths = match Paths::resolve(args.config) {
         Ok(p) => p,
         Err(e) => {
@@ -160,6 +174,9 @@ fn main() -> ExitCode {
             all,
         } => cli.unblock(when.as_deref(), range.as_deref(), rules, all),
         Cmd::Try { rule } => cli.try_rule(&rule),
+        Cmd::Fire { event, ssid } => cli.fire(&event, ssid.as_deref()),
+        Cmd::Install => shiodoki::install::install(&cli.paths, explicit_config),
+        Cmd::Uninstall => shiodoki::install::uninstall(&cli.paths),
     };
     match result {
         Ok(out) => {

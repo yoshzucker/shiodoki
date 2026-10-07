@@ -68,19 +68,7 @@ impl Cli {
     }
 
     fn period(&self, p: &Period) -> String {
-        let (a, b) = (
-            p.start.to_zoned(self.tz.clone()),
-            p.end.to_zoned(self.tz.clone()),
-        );
-        if a.date() == b.date() {
-            format!("{}-{}", a.strftime("%a %m-%d %H:%M"), b.strftime("%H:%M"))
-        } else {
-            format!(
-                "{} - {}",
-                a.strftime("%a %m-%d %H:%M"),
-                b.strftime("%a %m-%d %H:%M")
-            )
-        }
+        p.display(&self.tz)
     }
 
     fn rule<'c>(&self, config: &'c Config, id: &str) -> Result<&'c Rule, String> {
@@ -463,6 +451,31 @@ impl Cli {
         })
     }
 
+    fn agent_alive(&self) -> Result<bool, String> {
+        Ok(store::read_heartbeat(&self.paths)?
+            .is_some_and(|t| self.now.as_second() - t.as_second() <= ALIVE_SECS))
+    }
+
+    /// Hand the running agent an event, as if the OS had sent it.
+    pub fn fire(&self, event: &str, ssid: Option<&str>) -> Result<String, String> {
+        let text = match (event, ssid) {
+            ("network", Some(s)) => format!("network {s}"),
+            (_, Some(_)) => return Err("--ssid goes with network".into()),
+            (e @ ("unlock" | "wake" | "login" | "network"), None) => e.to_string(),
+            (e, None) => {
+                return Err(format!(
+                    "{e:?} is not an event (login, unlock, wake, network)"
+                ));
+            }
+        };
+        if !self.agent_alive()? {
+            return Err("the agent is not running".into());
+        }
+        let name = format!("{}-{}.event", self.now.as_millisecond(), std::process::id());
+        store::write_atomic(&self.paths.inbox().join(name), &format!("{text}\n"))?;
+        Ok(format!("handed {text} to the agent\n"))
+    }
+
     /// Run a rule's command now, in the foreground, whatever its schedule.
     pub fn try_rule(&self, id: &str) -> Result<String, String> {
         let config = self.config()?;
@@ -759,6 +772,24 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("skips    retro    2026-10-15"), "{s}");
+    }
+
+    #[test]
+    fn fire_needs_a_running_agent() {
+        let t = at(9, 0);
+        assert_eq!(
+            t.cli.fire("unlock", None).unwrap_err(),
+            "the agent is not running"
+        );
+        store::write_heartbeat(&t.cli.paths, t.cli.now).unwrap();
+        assert_eq!(
+            t.cli.fire("network", Some("My Office")).unwrap(),
+            "handed network My Office to the agent\n"
+        );
+        assert!(t.cli.fire("unlock", Some("x")).is_err());
+        assert!(t.cli.fire("lunch", None).is_err());
+        let files: Vec<_> = std::fs::read_dir(t.cli.paths.inbox()).unwrap().collect();
+        assert_eq!(files.len(), 1);
     }
 
     #[test]

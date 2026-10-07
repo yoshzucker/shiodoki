@@ -28,9 +28,12 @@ pub struct Context<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The agent started, in the session known by `session` (its logon
-    /// time, as the OS reports it).  A session not seen before is a login.
+    /// time, as the OS reports it), on the Wi-Fi network `ssid`.  A session
+    /// not seen before is a login, and starts with no network known, so the
+    /// one already joined counts as joining it.
     Start {
         session: String,
+        ssid: Option<String>,
     },
     Unlock,
     Wake,
@@ -105,12 +108,14 @@ pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
     // The network joined, when this event is a change of Wi-Fi network.
     let mut joined: Option<String> = None;
     match &obs.event {
-        Some(Event::Start { session }) if state.session.as_deref() != Some(session.as_str()) => {
-            state.session = Some(session.clone());
-            state.ssid = None;
-            fired.push(EventKind::Login);
+        Some(Event::Start { session, ssid }) => {
+            if state.session.as_deref() != Some(session.as_str()) {
+                state.session = Some(session.clone());
+                fired.push(EventKind::Login);
+                joined = ssid.clone();
+            }
+            state.ssid = ssid.clone();
         }
-        Some(Event::Start { .. }) => {}
         Some(Event::Unlock) => fired.push(EventKind::Unlock),
         Some(Event::Wake) => fired.push(EventKind::Wake),
         Some(Event::Network { ssid }) => {
@@ -183,12 +188,15 @@ pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
     out
 }
 
+/// Whether what happened is something `rule` listens for.  A rule with
+/// `ssid` hears joining one of those networks, however it was learned; a
+/// rule without hears every network event, and nothing else as one.
 fn listens(rule: &Rule, fired: &[EventKind], joined: Option<&str>) -> bool {
-    rule.on.iter().any(|k| {
-        fired.contains(k)
-            && (*k != EventKind::Network
-                || rule.ssid.is_empty()
-                || joined.is_some_and(|s| rule.ssid.iter().any(|x| x == s)))
+    rule.on.iter().any(|k| match k {
+        EventKind::Network if !rule.ssid.is_empty() => {
+            joined.is_some_and(|s| rule.ssid.iter().any(|x| x == s))
+        }
+        k => fired.contains(k),
     })
 }
 
@@ -303,7 +311,10 @@ mod tests {
     const WED: Date = date(2026, 10, 14);
 
     fn session(s: &str) -> Option<Event> {
-        Some(Event::Start { session: s.into() })
+        Some(Event::Start {
+            session: s.into(),
+            ssid: None,
+        })
     }
 
     #[test]
@@ -505,11 +516,24 @@ mod tests {
         let mut back = w.at(TUE, 14, 0, net(Some("Office")));
         back.sort();
         assert_eq!(back, ["any", "share"]);
-        // A new session starts with no network known.
-        w.at(WED, 8, 0, session("s2"));
-        let mut again = w.at(WED, 8, 1, net(Some("Office")));
-        again.sort();
-        assert_eq!(again, ["any", "share"]);
+        // A new session starts with no network known: being on it already
+        // is joining it, for the rules that name it and only those.
+        let start = |s: &str, ssid: &str| {
+            Some(Event::Start {
+                session: s.into(),
+                ssid: Some(ssid.into()),
+            })
+        };
+        assert_eq!(w.at(WED, 8, 0, start("s2", "Office")), ["share"]);
+        assert!(
+            w.at(WED, 8, 5, start("s2", "Office")).is_empty(),
+            "a restart is not joining"
+        );
+        assert!(
+            w.at(WED, 8, 6, net(Some("Office")))
+                .contains(&"any".to_string())
+        );
+        assert_eq!(w.at(WED, 9, 0, start("s3", "Cafe")), Vec::<String>::new());
     }
 
     #[test]
