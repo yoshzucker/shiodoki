@@ -78,7 +78,15 @@ enum Cmd {
         all: bool,
     },
     /// Run a rule's command now, ignoring its schedule
-    Try { rule: String },
+    Try {
+        rule: String,
+        /// Have the running agent run it, in its own environment, and say
+        /// how it went: the whole way from the agent to the command
+        #[arg(long)]
+        agent: bool,
+    },
+    /// Write the commented templates where there are no files yet
+    Init,
     /// Hand the running agent an event, as if the OS had sent it
     Fire {
         /// login, unlock, wake or network
@@ -173,7 +181,11 @@ fn main() -> ExitCode {
             rules,
             all,
         } => cli.unblock(when.as_deref(), range.as_deref(), rules, all),
-        Cmd::Try { rule } => cli.try_rule(&rule),
+        Cmd::Try { rule, agent: false } => cli.try_rule(&rule),
+        Cmd::Try { rule, agent: true } => {
+            cli.try_with_agent(&rule, std::time::Duration::from_secs(15))
+        }
+        Cmd::Init => cli.init(),
         Cmd::Fire { event, ssid } => cli.fire(&event, ssid.as_deref()),
         Cmd::Install => shiodoki::install::install(&cli.paths, explicit_config),
         Cmd::Uninstall => shiodoki::install::uninstall(&cli.paths),

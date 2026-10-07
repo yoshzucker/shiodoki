@@ -108,6 +108,30 @@ pub fn launch_agent_plist(exe: &Path, args: &[String], state_dir: &Path) -> Stri
     )
 }
 
+/// The login item, if there is one.
+pub fn installed() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let p = plist_path().ok();
+    #[cfg(windows)]
+    let p = shortcut_path().ok();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let p: Option<PathBuf> = None;
+    p.filter(|p| p.exists())
+}
+
+/// The templates, where there is no configuration yet, in the words of
+/// `install`'s report.
+#[cfg(any(target_os = "macos", windows))]
+fn init_report(paths: &Paths) -> Result<String, String> {
+    let mut out = String::new();
+    for (path, written) in store::init(paths, &jiff::tz::TimeZone::system())? {
+        if written {
+            out.push_str(&format!("wrote the template to {}\n", path.display()));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(target_os = "macos")]
 fn plist_path() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
@@ -149,9 +173,10 @@ pub fn install(paths: &Paths, explicit_config: bool) -> Result<String, String> {
     )?;
     let _ = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
     stop_running(paths)?;
+    let wrote = init_report(paths)?;
     launchctl(&["bootstrap", &domain(), &plist.to_string_lossy()])?;
     Ok(format!(
-        "installed {} and started the agent\n",
+        "{wrote}installed {} and started the agent\n",
         plist.display()
     ))
 }
@@ -159,13 +184,11 @@ pub fn install(paths: &Paths, explicit_config: bool) -> Result<String, String> {
 #[cfg(target_os = "macos")]
 pub fn uninstall(paths: &Paths) -> Result<String, String> {
     let plist = plist_path()?;
-    let _ = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
-    stop_running(paths)?;
+    let had = plist.exists();
+    let booted_out = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]).is_ok();
+    let stopped = stop_running(paths)?;
     store::remove_if_present(&plist)?;
-    Ok(format!(
-        "removed {} and stopped the agent\n",
-        plist.display()
-    ))
+    Ok(uninstalled(had.then_some(&plist), booted_out || stopped))
 }
 
 #[cfg(windows)]
@@ -230,12 +253,13 @@ pub fn install(paths: &Paths, explicit_config: bool) -> Result<String, String> {
         ));
     }
     stop_running(paths)?;
+    let wrote = init_report(paths)?;
     std::process::Command::new(&exe)
         .args(&args)
         .spawn()
         .map_err(|e| format!("{}: {e}", exe.display()))?;
     Ok(format!(
-        "installed {} and started the agent\n",
+        "{wrote}installed {} and started the agent\n",
         lnk.display()
     ))
 }
@@ -243,9 +267,10 @@ pub fn install(paths: &Paths, explicit_config: bool) -> Result<String, String> {
 #[cfg(windows)]
 pub fn uninstall(paths: &Paths) -> Result<String, String> {
     let lnk = shortcut_path()?;
+    let had = lnk.exists();
     store::remove_if_present(&lnk)?;
-    stop_running(paths)?;
-    Ok(format!("removed {} and stopped the agent\n", lnk.display()))
+    let stopped = stop_running(paths)?;
+    Ok(uninstalled(had.then_some(&lnk), stopped))
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -258,8 +283,23 @@ pub fn install(_: &Paths, _: bool) -> Result<String, String> {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 pub fn uninstall(paths: &Paths) -> Result<String, String> {
-    stop_running(paths)?;
-    Ok("stopped the agent\n".into())
+    let stopped = stop_running(paths)?;
+    Ok(uninstalled(None, stopped))
+}
+
+/// What `uninstall` did, and only that.
+fn uninstalled(item: Option<&PathBuf>, stopped: bool) -> String {
+    let mut out = String::new();
+    match item {
+        Some(p) => out.push_str(&format!("removed {}\n", p.display())),
+        None => out.push_str("there was no login item\n"),
+    }
+    out.push_str(if stopped {
+        "stopped the agent\n"
+    } else {
+        "no agent was running\n"
+    });
+    out
 }
 
 #[cfg(test)]

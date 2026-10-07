@@ -70,6 +70,8 @@ pub struct Agent {
     start: Option<Event>,
     /// Asked to stop, by `shiodoki uninstall`.
     quit: bool,
+    /// Rules `shiodoki try --agent` asked to run now, with its token.
+    tries: Vec<(String, String)>,
 }
 
 impl Agent {
@@ -89,6 +91,7 @@ impl Agent {
             last_beat: None,
             start: None,
             quit: false,
+            tries: vec![],
         };
         match store::load_state(&a.paths) {
             Ok(s) => a.state = s,
@@ -261,6 +264,10 @@ impl Agent {
                 self.quit = true;
                 continue;
             }
+            if let ["run", id, token] = text.split_whitespace().collect::<Vec<_>>()[..] {
+                self.tries.push((id.to_string(), token.to_string()));
+                continue;
+            }
             match parse_fired(&text, self.watch.ssid()) {
                 Ok(e) => {
                     self.log(&format!("fired: {}", text.trim()));
@@ -308,11 +315,8 @@ impl Agent {
     fn open_config(&mut self) -> Result<(), String> {
         let path = &self.paths.config;
         if !path.exists() {
-            store::write_atomic(path, STARTER)?;
-            self.log(&format!(
-                "wrote a starting configuration to {}",
-                path.display()
-            ));
+            store::write_atomic(path, store::CONFIG_TEMPLATE)?;
+            self.log(&format!("wrote the template to {}", path.display()));
         }
         launch::edit(path)
     }
@@ -356,25 +360,66 @@ impl Agent {
         for l in launches {
             self.start_one(&l, &env);
         }
+        self.run_tries();
     }
 
     fn start_one(&mut self, l: &Launch, env: &BTreeMap<String, String>) {
         let period = l.period.display(&self.tz);
-        match launch::start(&l.command, env, &Output::Log(self.paths.log())) {
-            Ok(Started::HandedOff) => self.log(&format!("ran {} ({period})", l.rule)),
+        self.start_logged(&l.rule, &l.command, env, &format!("({period})"), false);
+    }
+
+    /// Start `cmd` for `rule`, saying so in the log as `rule what`.  A
+    /// process's exit is logged when it fails, or always with `every_exit`.
+    fn start_logged(
+        &mut self,
+        rule: &str,
+        cmd: &crate::config::Command,
+        env: &BTreeMap<String, String>,
+        what: &str,
+        every_exit: bool,
+    ) {
+        match launch::start(cmd, env, &Output::Log(self.paths.log())) {
+            Ok(Started::HandedOff) => self.log(&format!("ran {rule} {what}: handed to the OS")),
             Ok(Started::Child(mut child)) => {
-                self.log(&format!("ran {} ({period}), pid {}", l.rule, child.id()));
-                let (rule, log, tz) = (l.rule.clone(), self.paths.log(), self.tz.clone());
-                std::thread::spawn(move || {
-                    if let Ok(status) = child.wait()
-                        && !status.success()
-                    {
-                        append(&log, &tz, &format!("{rule} exited with {status}"));
+                self.log(&format!("ran {rule} {what}, pid {}", child.id()));
+                let (label, log, tz) =
+                    (format!("{rule} {what}"), self.paths.log(), self.tz.clone());
+                std::thread::spawn(move || match child.wait() {
+                    Ok(status) if every_exit || !status.success() => {
+                        append(&log, &tz, &format!("{label} exited with {status}"))
                     }
+                    Err(e) => append(&log, &tz, &format!("{label}: {e}")),
+                    _ => {}
                 });
             }
-            Err(e) => self.log(&format!("could not run {}: {e}", l.rule)),
+            Err(e) => self.log(&format!("could not run {rule} {what}: {e}")),
         }
+    }
+
+    /// What `shiodoki try --agent` asked for: each rule's command now,
+    /// whatever its schedule, the lock or a pause.
+    fn run_tries(&mut self) {
+        for (id, token) in std::mem::take(&mut self.tries) {
+            let what = format!("for try {token}");
+            let Some(config) = &self.config else {
+                self.log(&format!(
+                    "cannot run {id} {what}: there is no configuration"
+                ));
+                continue;
+            };
+            let Some(rule) = config.rules.get(&id) else {
+                self.log(&format!("cannot run {id} {what}: there is no such rule"));
+                continue;
+            };
+            let (cmd, env) = (rule.command.clone(), config.env.clone());
+            self.start_logged(&id, &cmd, &env, &what, true);
+        }
+    }
+
+    /// Rules waiting to be tried, for the tests.
+    #[cfg(test)]
+    fn tries(&self) -> &[(String, String)] {
+        &self.tries
     }
 
     pub fn log(&self, msg: &str) {
@@ -432,18 +477,6 @@ pub fn parse_fired(text: &str, ssid: Option<String>) -> Result<Event, String> {
     };
     Ok(event)
 }
-
-const STARTER: &str = r#"# shiodoki configuration.  Rules are [rule.ID] tables; see the README:
-# https://github.com/yoshzucker/shiodoki#a-configuration
-#
-# day_starts = "04:00"
-#
-# [rule.example]
-# every = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
-# at    = "10:00"
-# until = "20m"
-# open  = "https://example.com/"
-"#;
 
 #[cfg(test)]
 mod tests {
@@ -631,6 +664,13 @@ mod tests {
         let s = t.sample(9, 1, 2, false);
         t.agent.tick(s);
         assert!(t.agent.wants_quit());
+        fs::write(inbox.join("5.event"), "run u 123-4\n").unwrap();
+        let s = t.sample(9, 1, 4, false);
+        assert!(
+            t.agent.tick(s).is_empty(),
+            "a try is not a launch of the rule's own"
+        );
+        assert_eq!(t.agent.tries(), [("u".to_string(), "123-4".to_string())]);
         assert_eq!(fs::read_dir(&inbox).unwrap().count(), 0, "each read once");
         assert!(t.log().contains("\"lunch\" is not an event"));
     }

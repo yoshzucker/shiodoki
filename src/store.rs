@@ -166,18 +166,38 @@ pub fn load_overrides(paths: &Paths, tz: &TimeZone) -> Result<Overrides, String>
     }
 }
 
-const OVERRIDES_HEADER: &str = "\
-# Skips and blocks, in local time.  `shiodoki skip` and `shiodoki block`
-# write this file; editing it by hand is fine too.
+/// A configuration with every setting there is, commented out.
+pub const CONFIG_TEMPLATE: &str = include_str!("../templates/config.toml");
+/// The head of every `overrides.toml` written: what it holds, in examples.
+pub const OVERRIDES_TEMPLATE: &str = include_str!("../templates/overrides.toml");
 
-";
-
+/// The commented examples, and the skips and blocks after them.  A file
+/// with none of either keeps the examples, as a reference for editing.
 pub fn save_overrides(paths: &Paths, o: &Overrides, tz: &TimeZone) -> Result<(), String> {
-    let path = paths.overrides();
-    if o.skips.is_empty() && o.blocks.is_empty() {
-        return remove_if_present(&path);
+    write_atomic(
+        &paths.overrides(),
+        &format!("{OVERRIDES_TEMPLATE}{}", o.to_toml(tz)),
+    )
+}
+
+/// Write the templates where there is no file yet; never over one.  Each
+/// path, and whether it was written.
+pub fn init(paths: &Paths, tz: &TimeZone) -> Result<Vec<(PathBuf, bool)>, String> {
+    let mut out = vec![];
+    if paths.config.exists() {
+        out.push((paths.config.clone(), false));
+    } else {
+        write_atomic(&paths.config, CONFIG_TEMPLATE)?;
+        out.push((paths.config.clone(), true));
     }
-    write_atomic(&path, &format!("{OVERRIDES_HEADER}{}", o.to_toml(tz)))
+    let o = paths.overrides();
+    if o.exists() {
+        out.push((o, false));
+    } else {
+        save_overrides(paths, &Overrides::default(), tz)?;
+        out.push((o, true));
+    }
+    Ok(out)
 }
 
 fn read_timestamp(path: &Path) -> Result<Option<Timestamp>, String> {
@@ -244,6 +264,58 @@ mod tests {
         }
     }
 
+    /// The template with every example taken out of its comment: a `#`
+    /// followed at once by something other than a space or another `#`.
+    fn uncommented(template: &str) -> String {
+        template
+            .lines()
+            .map(|l| match l.strip_prefix('#') {
+                Some(rest) if !rest.is_empty() && !rest.starts_with([' ', '#']) => rest,
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_templates_read_as_they_are_and_with_every_example_in_use() {
+        let tz = TimeZone::fixed(jiff::tz::offset(9));
+        for os in [Os::MacOS, Os::Windows] {
+            assert!(Config::parse(CONFIG_TEMPLATE, os).unwrap().rules.is_empty());
+            let all =
+                Config::parse(&uncommented(CONFIG_TEMPLATE), os).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                all.rules.len(),
+                13,
+                "{:?}",
+                all.rules.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            Overrides::parse(OVERRIDES_TEMPLATE, &tz).unwrap(),
+            Overrides::default()
+        );
+        let o = Overrides::parse(&uncommented(OVERRIDES_TEMPLATE), &tz).unwrap();
+        assert_eq!((o.skips.len(), o.blocks.len()), (2, 2));
+    }
+
+    #[test]
+    fn init_writes_only_what_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let tz = TimeZone::UTC;
+        let written: Vec<bool> = init(&p, &tz).unwrap().into_iter().map(|(_, w)| w).collect();
+        assert_eq!(written, [true, true]);
+        assert_eq!(fs::read_to_string(&p.config).unwrap(), CONFIG_TEMPLATE);
+        fs::write(&p.config, "[rule.mine]\nrun = [\"x\"]\n").unwrap();
+        let written: Vec<bool> = init(&p, &tz).unwrap().into_iter().map(|(_, w)| w).collect();
+        assert_eq!(written, [false, false]);
+        assert!(
+            fs::read_to_string(&p.config).unwrap().contains("rule.mine"),
+            "never over a file"
+        );
+    }
+
     #[test]
     fn missing_files_are_empty_not_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -260,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_and_removes_what_is_empty() {
+    fn round_trips_and_keeps_the_examples() {
         let dir = tempfile::tempdir().unwrap();
         let p = paths(dir.path());
         let tz = TimeZone::fixed(jiff::tz::offset(9));
@@ -274,7 +346,9 @@ mod tests {
         assert!(p.overrides().starts_with(dir.path().join("conf")));
         assert_eq!(load_overrides(&p, &tz).unwrap(), o);
         save_overrides(&p, &Overrides::default(), &tz).unwrap();
-        assert!(!p.overrides().exists());
+        let kept = fs::read_to_string(p.overrides()).unwrap();
+        assert_eq!(kept, OVERRIDES_TEMPLATE, "only the examples are left");
+        assert_eq!(load_overrides(&p, &tz).unwrap(), Overrides::default());
 
         let now: Timestamp = "2026-10-13T01:00:00Z".parse().unwrap();
         let later: Timestamp = "2026-10-13T03:00:00Z".parse().unwrap();

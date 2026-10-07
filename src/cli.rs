@@ -234,6 +234,14 @@ impl Cli {
                 format!("{}  {who}", self.period(&p))
             }),
         );
+        let _ = writeln!(out, "config   {}", self.paths.config.display());
+        let _ = writeln!(out, "         {}", self.paths.overrides().display());
+        let _ = writeln!(out, "state    {}", self.paths.state_dir.display());
+        let login = match crate::install::installed() {
+            Some(p) => format!("starts the agent ({})", p.display()),
+            None => "not installed (shiodoki install)".to_string(),
+        };
+        let _ = writeln!(out, "login    {login}");
         Ok(out)
     }
 
@@ -476,6 +484,76 @@ impl Cli {
         Ok(format!("handed {text} to the agent\n"))
     }
 
+    /// Write the templates where there are no files yet.
+    pub fn init(&self) -> Result<String, String> {
+        let mut out = String::new();
+        for (path, written) in store::init(&self.paths, &self.tz)? {
+            let verb = if written { "wrote" } else { "left " };
+            let _ = writeln!(out, "{verb} {}", path.display());
+        }
+        Ok(out)
+    }
+
+    /// Ask the running agent to run a rule's command now, and report what
+    /// it says in its log: the whole way from the agent to the command, in
+    /// the environment the login item gives it.
+    pub fn try_with_agent(&self, id: &str, wait: std::time::Duration) -> Result<String, String> {
+        let config = self.config()?;
+        self.rule(&config, id)?;
+        if !self.agent_alive()? {
+            return Err("the agent is not running".into());
+        }
+        let log = self.paths.log();
+        let from = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) as usize;
+        let token = format!("{}-{}", self.now.as_millisecond(), std::process::id());
+        store::write_atomic(
+            &self.paths.inbox().join(format!("{token}-try.event")),
+            &format!("run {id} {token}\n"),
+        )?;
+        let mark = format!(" for try {token}");
+        let deadline = std::time::Instant::now() + wait;
+        let mut said: Vec<String> = vec![];
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let text = std::fs::read(&log).unwrap_or_default();
+            let new = String::from_utf8_lossy(text.get(from..).unwrap_or_default()).into_owned();
+            said = new
+                .lines()
+                .filter(|l| l.contains(&mark))
+                // Without the timestamp and the token: the run is ours.
+                .map(|l| {
+                    l.split_once(' ')
+                        .map_or(l, |(_, rest)| rest)
+                        .replace(&mark, "")
+                })
+                .collect();
+            let ended = said.iter().any(|l| {
+                l.contains("handed to the OS")
+                    || l.contains(" exited with ")
+                    || l.starts_with("cannot run")
+                    || l.starts_with("could not run")
+            });
+            if ended {
+                let out: String = said.iter().map(|l| format!("agent: {l}\n")).collect();
+                let ok = said
+                    .iter()
+                    .any(|l| l.contains("handed to the OS") || l.ends_with("exit status: 0"));
+                return if ok {
+                    Ok(out)
+                } else {
+                    Err(out.trim_end().to_string())
+                };
+            }
+        }
+        let mut out: String = said.iter().map(|l| format!("agent: {l}\n")).collect();
+        out.push_str(if said.is_empty() {
+            "the agent did not take it up; is it the agent for this configuration?"
+        } else {
+            "the agent has not said how it ended"
+        });
+        Err(out)
+    }
+
     /// Run a rule's command now, in the foreground, whatever its schedule.
     pub fn try_rule(&self, id: &str) -> Result<String, String> {
         let config = self.config()?;
@@ -695,8 +773,8 @@ mod tests {
             "no longer skipping those of retro\n"
         );
         assert!(
-            !t.cli.paths.overrides().exists(),
-            "an empty file is removed"
+            overrides(&t).skips.is_empty(),
+            "nothing is skipped any more"
         );
     }
 
@@ -772,6 +850,70 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("skips    retro    2026-10-15"), "{s}");
+    }
+
+    #[test]
+    fn try_with_the_agent_reads_its_answer_from_the_log() {
+        let t = at(9, 0);
+        let wait = std::time::Duration::from_millis(300);
+        assert_eq!(
+            t.cli.try_with_agent("retro", wait).unwrap_err(),
+            "the agent is not running"
+        );
+        store::write_heartbeat(&t.cli.paths, t.cli.now).unwrap();
+        let err = t.cli.try_with_agent("retro", wait).unwrap_err();
+        assert!(err.contains("did not take it up"), "{err}");
+        std::fs::remove_dir_all(t.cli.paths.inbox()).unwrap();
+
+        // An agent that answers: a thread of this test, writing the log.
+        let paths = t.cli.paths.clone();
+        let answer = std::thread::spawn(move || {
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let found = std::fs::read_dir(paths.inbox())
+                    .ok()
+                    .and_then(|mut d| d.next())
+                    .and_then(|e| e.ok())
+                    .map(|e| e.path());
+                let Some(f) = found else { continue };
+                let asked = std::fs::read_to_string(&f).unwrap();
+                let token = asked.split_whitespace().nth(2).unwrap().to_string();
+                assert!(asked.starts_with("run retro "));
+                std::fs::remove_file(&f).unwrap();
+                let mut log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(paths.log())
+                    .unwrap();
+                use std::io::Write as _;
+                writeln!(log, "T ran retro for try {token}, pid 1").unwrap();
+                writeln!(log, "T retro for try {token} exited with exit status: 0").unwrap();
+                return;
+            }
+            panic!("nothing was asked");
+        });
+        let out = t
+            .cli
+            .try_with_agent("retro", std::time::Duration::from_secs(5))
+            .unwrap();
+        answer.join().unwrap();
+        assert_eq!(
+            out,
+            "agent: ran retro, pid 1\nagent: retro exited with exit status: 0\n"
+        );
+    }
+
+    #[test]
+    fn init_reports_what_it_wrote() {
+        let t = at(9, 0);
+        assert_eq!(
+            t.cli.init().unwrap(),
+            format!(
+                "left  {}\nwrote {}\n",
+                t.cli.paths.config.display(),
+                t.cli.paths.overrides().display()
+            )
+        );
     }
 
     #[test]

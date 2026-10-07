@@ -1,0 +1,29 @@
+# shiodoki overrides: skips and blocks, in local time.
+#
+# `shiodoki skip` and `shiodoki block` add to this file, and drop what has
+# expired, below these lines; editing by hand is fine too.  A line that is
+# "#" and then a setting, with no space between, is an example.
+#
+# Skip one period of a rule -- this week's meeting:
+#[[skip]]
+#rule = "weekly-review"
+#on   = 2026-10-13
+#
+# Skip every period from one day to another, both included -- a holiday:
+#[[skip]]
+#rule = "retro"
+#from = 2026-12-21
+#to   = 2027-01-08
+#
+# Hold every rule back for a stretch of time -- a presentation.  What falls
+# due meanwhile runs when it ends, if its period is still open:
+#[[block]]
+#from = 2026-10-15T13:00:00
+#to   = 2026-10-15T15:00:00
+#
+# Hold only some rules back:
+#[[block]]
+#from  = 2026-10-16T09:00:00
+#to    = 2026-10-16T12:00:00
+#rules = ["weekly-review"]
+

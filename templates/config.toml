@@ -1,0 +1,141 @@
+# shiodoki configuration
+#
+# Each [rule.ID] says what to run and when it may run.  A line that is "#"
+# and then a setting, with no space between, is an example: delete the "#"
+# to use it.  The whole reference is the README:
+#
+#   https://github.com/yoshzucker/shiodoki
+#
+# Skips and blocks live in overrides.toml beside this file, a pause in this
+# machine's state.  `shiodoki check` says what is wrong with this file, and
+# the agent reads it again whenever it changes.
+
+# Where one day ends and the next begins: for the rules that run once a day,
+# for a period with no `until`, and for "today" in skip, block and pause.
+#day_starts = "04:00"
+
+# The agent starts at login and does not read your shell profile, so its
+# PATH is the system's minimal one.  Give full paths below, or set it here.
+#[env]
+#PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+
+# --- Timed rules -----------------------------------------------------------
+#
+# A period opens at `at` and closes at `until`.  The rule runs at the first
+# moment in it that the screen is unlocked, and not at all if there is none.
+
+# A meeting page: at 10:00 on Tuesdays if the screen is unlocked, otherwise
+# at the unlock -- unless that is after 10:20.
+#[rule.weekly-review]
+#every = "FREQ=WEEKLY;BYDAY=TU"
+#at    = "10:00"
+#until = "20m"
+#open  = "https://meet.example.com/weekly-review"
+#with  = "Firefox"
+#  `with` is an application name on macOS, and an executable name or path
+#  on Windows ("firefox.exe").  Without it, the default browser.
+
+# Every other Thursday, counted from the first one, but not on a holiday.
+#[rule.retro]
+#every  = "FREQ=WEEKLY;INTERVAL=2;BYDAY=TH"
+#from   = 2026-01-08
+#at     = "15:00"
+#until  = "15:15"
+#except = [2026-12-24]
+#open   = "https://meet.example.com/retro"
+
+# The second Tuesday of the month, any time in the morning.
+#[rule.monthly-report]
+#every = "FREQ=MONTHLY;BYDAY=2TU"
+#at    = "09:00"
+#until = "12:00"
+#open  = "https://docs.example.com/monthly-report"
+
+# The last weekday of the month.
+#[rule.timesheet]
+#every = "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1"
+#at    = "17:00"
+#until = "19:00"
+#open  = "https://hr.example.com/timesheet"
+
+# Weekdays at 18:00, behind a locked screen too.  Without `until` the period
+# lasts to the end of the day, so a machine woken late still catches it.
+#[rule.backup]
+#every    = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+#at       = "18:00"
+#unlocked = false
+#run      = ["/usr/local/bin/backup", "--quiet"]
+
+
+# --- Event rules -----------------------------------------------------------
+#
+# `on` lists what makes the rule due: login, unlock, wake, network.  Without
+# `once` it runs on every such event; with it, once a period -- a day, unless
+# `at` and `until` say otherwise.
+
+# Every login.
+#[rule.mount-shares]
+#on  = ["login"]
+#run = ["/usr/local/bin/mount-shares"]
+
+# The first time you sit down on a weekday morning, however you arrive.
+#[rule.morning-capture]
+#on    = ["login", "unlock", "wake"]
+#once  = true
+#every = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+#until = "12:00"
+#run   = ["emacsclient", "-c", "-e", "(org-capture nil \"t\")"]
+
+# Joining one Wi-Fi network (Windows only, for now), behind a locked screen
+# too.
+#[rule.office-share]
+#on       = ["network"]
+#ssid     = ["Example-Office"]
+#unlocked = false
+#run      = ['C:\Windows\System32\net.exe', "use", "S:", '\\files.example.com\team']
+
+# Any change of network: a Wi-Fi network joined, a cable, a tethered phone.
+#[rule.network-log]
+#on  = ["network"]
+#run = ["/bin/sh", "-c", "date >> \"$HOME/network-changes.log\""]
+
+
+# --- Running things --------------------------------------------------------
+#
+# `run` starts a program directly, with no shell: ask for one when you want
+# one, as above with /bin/sh, or with ["cmd", "/c", "..."] on Windows.
+
+# One rule, a different way of running it on each OS: a [rule.ID.macos] or
+# [rule.ID.windows] table replaces the rule's settings on that OS.
+#[rule.weekly-notes]
+#every = "FREQ=WEEKLY;BYDAY=FR"
+#at    = "16:00"
+#until = "18:00"
+#open  = "https://notes.example.com/weekly"
+#[rule.weekly-notes.macos]
+#with  = "Safari"
+#[rule.weekly-notes.windows]
+#with  = "msedge.exe"
+
+# A console program with a window of its own, on Windows.  Without `window`
+# it runs hidden.
+#[rule.console]
+#on     = ["login"]
+#run    = ["cmd", "/c", "echo shiodoki started & pause"]
+#window = true
+
+# A rule kept in the file without running.
+#[rule.later]
+#enabled = false
+#at      = "12:00"
+#open    = "https://example.com/"
+
+# To see that everything is connected, use this one and run
+#
+#   shiodoki try --agent hello
+#
+# The running agent opens the page now, the way it would at a rule's moment.
+#[rule.hello]
+#on   = ["unlock"]
+#open = "https://example.com/"

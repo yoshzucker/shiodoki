@@ -180,7 +180,8 @@ A pause belongs to the machine it was set on. Skips and blocks sit next to
 the configuration and go wherever it goes: if one configuration is synced
 between two machines, skipping a meeting skips it on both, and pausing one
 machine for a presentation pauses only that one. Expired entries are
-removed the next time shiodoki writes the file.
+removed the next time shiodoki writes the file; the commented examples at
+its head stay.
 
 ```sh
 shiodoki pause 2h                        # or 30m, --until 15:30, --today
@@ -203,7 +204,8 @@ blocks overlapping a day or a stretch of one (`--rule` narrows it to blocks
 naming exactly those rules), or every block with `--all`.
 
 `overrides.toml` is plain TOML in local time, for reading and editing by
-hand as much as for the commands:
+hand as much as for the commands. Its [template](templates/overrides.toml)
+heads it with commented examples of each kind; the entries look like this:
 
 ```
 [[skip]]
@@ -244,8 +246,10 @@ minimal one. Give full paths, or set `PATH` and anything else under `[env]`.
 | `shiodoki pause` / `resume` | See [Holding back](#holding-back) |
 | `shiodoki skip` / `unskip` | See [Holding back](#holding-back) |
 | `shiodoki block` / `unblock` | See [Holding back](#holding-back) |
+| `shiodoki init` | Write the templates -- every setting there is, as commented examples -- where there is no `config.toml` or `overrides.toml` yet. It never writes over a file |
 | `shiodoki check` | Read the configuration and report what is wrong with it, without the agent |
 | `shiodoki try ID` | Run a rule's command now, ignoring its schedule, to see that it works. It runs in the foreground, with its output in the terminal, and `try` waits for it to exit |
+| `shiodoki try --agent ID` | Have the running agent run it now -- whatever the schedule, the lock or a pause -- and report what the agent's log says: how the command exited, or that it was handed to the OS. This is the whole way from the login item to the command, in the environment the agent really has, which is not your shell's |
 | `shiodoki fire EVENT [--ssid NAME]` | Hand the running agent an event as if the OS had sent it: `login` (as a new session), `unlock`, `wake`, `network`. It is refused when no agent is running, rather than kept for one that starts later |
 | `shiodoki install` / `uninstall` | Add the login item and start the agent, or remove it and stop the agent |
 
@@ -262,7 +266,21 @@ waiting  weekly-review    Tue 10-13 10:00-10:20
 next     Thu 10-15 15:00-15:15  retro  (skipped)
          Tue 10-20 10:00-10:20  weekly-review
 skips    retro            2026-10-15
+config   /Users/you/.config/shiodoki/config.toml
+         /Users/you/.config/shiodoki/overrides.toml
+state    /Users/you/.local/state/shiodoki
+login    starts the agent (/Users/you/Library/LaunchAgents/io.github.yoshzucker.shiodoki.plist)
 ```
+
+To see that everything is connected after installing:
+
+```
+$ shiodoki status              # agent running, login item there
+$ shiodoki try --agent hello   # a rule run by the agent, now
+$ shiodoki fire unlock         # an event, as if the OS had sent it
+```
+
+The template has a `hello` rule for the second.
 
 The agent reads the configuration again whenever it or `overrides.toml`
 changes. A configuration with an error is reported -- on the icon and in the
@@ -289,6 +307,11 @@ back are due as usual; events in between are not seen.
 |---|---|---|
 | `config.toml`, `overrides.toml` | `~/.config/shiodoki/` (`$XDG_CONFIG_HOME`) | `%APPDATA%\shiodoki\` |
 | `state.json`, `pause`, `heartbeat`, `shiodoki.log` | `~/.local/state/shiodoki/` (`$XDG_STATE_HOME`) | `%LOCALAPPDATA%\shiodoki\` |
+
+Templates for both are in [`templates/`](templates/), and inside `shiodoki`
+itself: `shiodoki init` writes them, and so do `shiodoki install` and the
+icon's Open configuration when there is no configuration yet. Neither
+writes over one.
 
 `--config PATH`, or `SHIODOKI_CONFIG`, puts the configuration somewhere else
 -- a synced folder, for one. `shiodoki install --config PATH` writes that
