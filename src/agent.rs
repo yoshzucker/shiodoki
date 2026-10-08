@@ -385,9 +385,11 @@ impl Agent {
                 let (label, log, tz) =
                     (format!("{rule} {what}"), self.paths.log(), self.tz.clone());
                 std::thread::spawn(move || match child.wait() {
-                    Ok(status) if every_exit || !status.success() => {
-                        append(&log, &tz, &format!("{label} exited with {status}"))
-                    }
+                    Ok(status) if every_exit || !status.success() => append(
+                        &log,
+                        &tz,
+                        &format!("{label} exited with {}", launch::ended(status)),
+                    ),
                     Err(e) => append(&log, &tz, &format!("{label}: {e}")),
                     _ => {}
                 });

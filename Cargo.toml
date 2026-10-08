@@ -20,7 +20,7 @@ tao = "0.37"
 tray-icon = "0.26"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_RemoteDesktop", "Win32_NetworkManagement_WiFi"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_RemoteDesktop", "Win32_System_Registry", "Win32_System_Threading", "Win32_NetworkManagement_WiFi"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"

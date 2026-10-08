@@ -566,10 +566,11 @@ impl Cli {
                     Command::Run { .. } => "exited",
                     Command::Open { .. } => "open exited",
                 };
+                let how = launch::ended(status);
                 if status.success() {
-                    Ok(format!("{id}: {what} with {status}\n"))
+                    Ok(format!("{id}: {what} with {how}\n"))
                 } else {
-                    Err(format!("{id}: {what} with {status}"))
+                    Err(format!("{id}: {what} with {how}"))
                 }
             }
         }

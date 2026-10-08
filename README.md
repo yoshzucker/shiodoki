@@ -368,6 +368,16 @@ On Windows the agent is built as a window program, so starting it at login
 opens no console, and console programs it runs start without one unless the
 rule says `window = true`.
 
+Windows lets only the program in front bring a window to the front, and the
+agent never is in front. So when `open` starts a program, the agent waits
+for that program's new window, up to 30 seconds, and brings it forward
+itself, as `open` on macOS brings the application. Without that, the
+program would open behind whatever is in front, and some programs do not
+finish starting until their window is activated: a browser built on Firefox
+has been seen to show a blank window and drop the page. If no new window
+comes, as when a running browser opens the page in a tab of a window it
+already has, nothing is brought forward.
+
 ## Not yet
 
 - Calendars as a source of periods: an `.ics` file or URL in place of
