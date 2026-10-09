@@ -102,6 +102,15 @@
 #on  = ["network"]
 #run = ["/bin/sh", "-c", "date >> \"$HOME/network-changes.log\""]
 
+# `ssid` on any rule keeps it to those networks: weekdays from 17:30, at the
+# office -- or on getting there, if that is before 20:00.
+#[rule.office-evening]
+#every = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+#at    = "17:30"
+#until = "20:00"
+#ssid  = ["Example-Office"]
+#open  = "https://hr.example.com/timesheet"
+
 
 # --- Running things --------------------------------------------------------
 #

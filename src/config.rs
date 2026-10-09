@@ -68,6 +68,7 @@ pub struct Rule {
     /// Empty for a timed rule.
     pub on: Vec<EventKind>,
     pub once: bool,
+    /// The Wi-Fi networks the rule runs on; empty for any.
     pub ssid: Vec<String>,
     pub unlocked: bool,
     pub except: Vec<Date>,
@@ -393,13 +394,6 @@ fn parse_rule(id: &str, value: &Value, os: Os) -> Result<Rule, Vec<String>> {
             "only means something with `on`; a timed rule runs once a period anyway".into(),
         ));
     }
-    if !ssid.is_empty() && !on.contains(&EventKind::Network) {
-        problems.push(at_rule(
-            "ssid",
-            "only means something with `on = [\"network\"]`".into(),
-        ));
-    }
-
     match (problems.is_empty(), schedule, command) {
         (true, Some(schedule), Some(command)) => Ok(Rule {
             id: id.to_string(),
@@ -630,7 +624,6 @@ mod tests {
         has("rule.a: give `run` or `open`, not both");
         has("rule.b.every: `from` is required");
         has("rule.b.once");
-        has("rule.b.ssid");
         has("rule.b.window");
         has("rule.has space: an ID");
         has("rule.c.on: \"lunch\" is not an event");

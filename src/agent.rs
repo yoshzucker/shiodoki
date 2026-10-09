@@ -192,7 +192,10 @@ impl Agent {
         }
         for n in notes {
             let line = match n {
-                Note::Waiting { rule, .. } => format!("{rule} is due, and waits"),
+                Note::Waiting { rule, hold, .. } => format!(
+                    "{rule} is due, and waits {}",
+                    hold.describe(&config.rules[&rule])
+                ),
                 Note::Lapsed { rule, .. } => format!("{rule} lapsed: its period closed first"),
                 Note::Skipped { rule, .. } => format!("{rule} was waiting, and is skipped"),
                 Note::Arrived { ssid } => format!("arrived on {ssid}"),

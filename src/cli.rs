@@ -12,6 +12,7 @@ use jiff::tz::TimeZone;
 
 use crate::clock::{DayStart, next_reading, parse_length, parse_time};
 use crate::config::{Command, Config, Os, Rule};
+use crate::engine::Hold;
 use crate::launch::{self, Output, Started};
 use crate::overrides::{Block, Overrides};
 use crate::period::Period;
@@ -109,13 +110,13 @@ impl Cli {
                 .map(|k| format!("{k:?}").to_lowercase())
                 .collect();
             let _ = write!(s, "on {}", on.join(", "));
-            if !rule.ssid.is_empty() {
-                let _ = write!(s, " ({})", rule.ssid.join(", "));
-            }
             if rule.once {
                 s.push_str(", once a period");
             }
             s.push_str("; ");
+        }
+        if !rule.ssid.is_empty() {
+            let _ = write!(s, "at {}; ", rule.ssid.join(", "));
         }
         match rule.period_at(self.now, ds, &self.tz) {
             Some(p) => {
@@ -163,22 +164,26 @@ impl Cli {
         };
         let _ = writeln!(out, "network  {network}");
 
-        let waiting: Vec<(String, Period)> = state
+        let waiting: Vec<(String, Period, Option<Hold>)> = state
             .rules
             .iter()
             .filter_map(|(id, r)| {
                 r.due
                     .filter(|p| p.contains(self.now))
-                    .map(|p| (id.clone(), p))
+                    .map(|p| (id.clone(), p, r.hold))
             })
             .collect();
         let width = config.rules.keys().map(String::len).max().unwrap_or(0);
         section(
             &mut out,
             "waiting",
-            waiting
-                .iter()
-                .map(|(id, p)| format!("{id:width$}  {}", self.period(p))),
+            waiting.iter().map(|(id, p, hold)| {
+                let mut line = format!("{id:width$}  {}", self.period(p));
+                if let (Some(h), Some(rule)) = (hold, config.rules.get(id)) {
+                    let _ = write!(line, "  {}", h.describe(rule));
+                }
+                line
+            }),
         );
 
         let mut next: Vec<(Period, &str)> = config
@@ -614,6 +619,10 @@ mod tests {
         once = true
         until = "12:00"
         run = ["sh", "-c", "exit 4"]
+        [rule.intranet]
+        on = ["network"]
+        ssid = ["Example-Home"]
+        run = ["sh", "-c", "exit 0"]
     "#;
 
     struct T {
@@ -650,10 +659,19 @@ mod tests {
     fn check_reports_rules_and_problems() {
         let t = at(9, 0);
         let out = t.cli.check().unwrap();
-        assert!(out.contains("3 rules"), "{out}");
-        assert!(out.contains("review   next Tue 10-13 10:00-10:20"), "{out}");
+        assert!(out.contains("4 rules"), "{out}");
         assert!(
-            out.contains("morning  on unlock, once a period; listening now, Tue 10-13 04:00-12:00"),
+            out.contains("intranet  on network; at Example-Home; listening now"),
+            "{out}"
+        );
+        assert!(
+            out.contains("review    next Tue 10-13 10:00-10:20"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "morning   on unlock, once a period; listening now, Tue 10-13 04:00-12:00"
+            ),
             "{out}"
         );
         std::fs::write(&t.cli.paths.config, "[rule.x]\nat = \"25:00\"").unwrap();
@@ -718,7 +736,7 @@ mod tests {
             RuleState {
                 ran: Some(ran),
                 ran_at: Some(ran),
-                due: None,
+                ..RuleState::default()
             },
         );
         store::save_state(&t.cli.paths, &state).unwrap();
@@ -747,7 +765,7 @@ mod tests {
             t.cli
                 .skip("nope", Which::Next)
                 .unwrap_err()
-                .contains("the rules are: morning, retro, review")
+                .contains("the rules are: intranet, morning, retro, review")
         );
         assert_eq!(
             t.cli
@@ -843,6 +861,7 @@ mod tests {
                 ran: None,
                 ran_at: None,
                 due: Some(p),
+                hold: Some(Hold::Locked),
             },
         );
         state.ssid = Some("Example-Office".into());
@@ -857,12 +876,15 @@ mod tests {
             s.contains("network  Example-Office, arrived Tue 10-13 09:40"),
             "{s}"
         );
-        assert!(s.contains("waiting  review   Tue 10-13 10:00-10:20"), "{s}");
+        assert!(
+            s.contains("waiting  review    Tue 10-13 10:00-10:20  for an unlock"),
+            "{s}"
+        );
         assert!(
             s.contains("next     Thu 10-15 15:00-15:15  retro  (skipped)"),
             "{s}"
         );
-        assert!(s.contains("skips    retro    2026-10-15"), "{s}");
+        assert!(s.contains("skips    retro     2026-10-15"), "{s}");
     }
 
     #[test]

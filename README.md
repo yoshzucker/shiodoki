@@ -30,7 +30,8 @@ note, syncing a folder, mounting a share.
 - A rule becomes **due** when its period opens (a *timed* rule), or when an
   event it listens for arrives inside its period (an *event* rule).
 - A due rule **runs** at the first moment it is **clear**: the session is
-  unlocked, and nothing pauses or blocks it. If the period closes first, the
+  unlocked, nothing pauses or blocks it, and -- for a rule that names
+  networks -- the machine is on one of them. If the period closes first, the
   rule **lapses** for that period.
 
 Everything else follows from those four. Waiting for an unlock, giving up
@@ -101,7 +102,7 @@ it.
 | `until` | When a period closes: a time of day (`"10:20"`) or a length (`"20m"`, `"2h"`). A time earlier than `at` is on the next day | the end of the day |
 | `on` | The events that make the rule due: `login`, `unlock`, `wake`, `network`. Without `on` the rule is timed | -- |
 | `once` | For an event rule: run at most once a period, instead of on every event | `false` |
-| `ssid` | With `network`: the Wi-Fi networks to arrive on -- see [Networks](#networks) | any change |
+| `ssid` | The Wi-Fi networks the rule runs on; with `network`, arriving on one of them -- see [Networks](#networks) | any network |
 | `unlocked` | Wait for an unlocked session before running | `true` |
 | `except` | Dates the rule never runs on, such as holidays | `[]` |
 | `enabled` | `false` keeps a rule in the file without it running | `true` |
@@ -109,8 +110,8 @@ it.
 
 A period also ends when the rule's next one opens, so a rule is never in
 two periods at once. A timed rule always runs once a period, at most.
-`once` on a timed rule, `ssid` without `network`, or a key shiodoki does not
-know is an error rather than something quietly ignored.
+`once` on a timed rule, or a key shiodoki does not know, is an error rather
+than something quietly ignored.
 
 `day_starts` (default `"00:00"`) is where one day ends and the next begins:
 for a rule with no `at`, for an `until` that defaults to the end of the day,
@@ -151,12 +152,18 @@ if its period is still open. Several events held for one rule run it once.
 
 ### Networks
 
-With `network` in `on`, `ssid` says which network events the rule hears:
-**arriving** on one of those networks from a different one. Time with no
-Wi-Fi in between -- asleep, reconnecting, on the way with the lid closed --
-is not leaving: back on the network it was on, the machine has not arrived
-anywhere. Another adapter coming up while the Wi-Fi stays the same is not
-arriving either.
+`ssid` names the Wi-Fi networks a rule belongs to, and it runs only while
+the machine is on one of them. A rule that is due anywhere else waits, as it
+waits for an unlock, and runs on getting there if its period is still open.
+While the Wi-Fi is down -- reconnecting, or just woken -- the machine is on
+none.
+
+With `network` in `on`, `ssid` also says which network events the rule
+hears: **arriving** on one of those networks from a different one. Time
+with no Wi-Fi in between -- asleep, reconnecting, on the way with the lid
+closed -- is not leaving: back on the network it was on, the machine has not
+arrived anywhere. Another adapter coming up while the Wi-Fi stays the same
+is not arriving either.
 
 A login starts with no network known, so the one the machine is on counts
 as arrived on. So does coming back to it on a new day: a wake or an unlock,
@@ -165,7 +172,7 @@ through the night arrives in the morning wherever it wakes; one worked on
 past `day_starts` without a break does not.
 
 A wake leaves the network unknown until it has settled again, because the
-machine may have woken somewhere else: only then can it arrive anywhere.
+machine may have woken somewhere else. Until then a rule with `ssid` waits.
 
 ### Time
 
@@ -260,7 +267,7 @@ minimal one. Give full paths, or set `PATH` and anything else under `[env]`.
 | Command | What it does |
 |---|---|
 | `shiodoki-agent [--config PATH]` | The resident process: the icon, the events and the clock. What the login item starts. A second one in the same state directory stops at once |
-| `shiodoki status` | Whether the agent is running or paused, the network it last arrived on, which rules are due and waiting, and the next periods with skips and blocks applied |
+| `shiodoki status` | Whether the agent is running or paused, the network it last arrived on, which rules are due and what they wait for, and the next periods with skips and blocks applied |
 | `shiodoki pause` / `resume` | See [Holding back](#holding-back) |
 | `shiodoki skip` / `unskip` | See [Holding back](#holding-back) |
 | `shiodoki block` / `unblock` | See [Holding back](#holding-back) |
@@ -281,7 +288,7 @@ $ shiodoki status
 agent    running (seen Tue 10-13 10:05)
 pause    not paused
 network  Example-Office, arrived Tue 10-13 09:40
-waiting  weekly-review    Tue 10-13 10:00-10:20
+waiting  weekly-review    Tue 10-13 10:00-10:20  for an unlock
 next     Thu 10-15 15:00-15:15  retro  (skipped)
          Tue 10-20 10:00-10:20  weekly-review
 skips    retro            2026-10-15
@@ -381,7 +388,7 @@ network change once the answers have held for three samples.
 | Locked? | the current session's dictionary (`CGSSessionScreenIsLocked`) | the session's flags from the Terminal Services API |
 | `wake` | the wall clock running ahead of the agent's own, which stops in sleep | the agent having been stopped for longer than a sample takes |
 | `network` | the interfaces that are up, and their IPv4 addresses | the same |
-| `ssid` | Not yet -- macOS tells only an app bundle granted Location Services which Wi-Fi network it is on | the WLAN API. On Windows 11 24H2 and later it needs *Let desktop apps access your location* (Settings > Privacy & security > Location), one switch for every desktop app; without it no network is known |
+| `ssid` | Not yet -- macOS tells only an app bundle granted Location Services which Wi-Fi network it is on, so a rule with `ssid` never runs | the WLAN API. On Windows 11 24H2 and later it needs *Let desktop apps access your location* (Settings > Privacy & security > Location), one switch for every desktop app; without it no network is known |
 
 On Windows the agent is built as a window program, so starting it at login
 opens no console, and console programs it runs start without one unless the

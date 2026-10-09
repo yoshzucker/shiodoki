@@ -79,6 +79,33 @@ pub struct RuleState {
     /// The period the rule is due in, waiting to be clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due: Option<Period>,
+    /// What it waits for, as of the last look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<Hold>,
+}
+
+/// What keeps a due rule from being clear: the first of them, in the order
+/// they are looked at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hold {
+    Locked,
+    Paused,
+    Blocked,
+    /// Not on one of its networks.
+    Away,
+}
+
+impl Hold {
+    /// What `rule` waits for, as the log and `status` say it.
+    pub fn describe(&self, rule: &Rule) -> String {
+        match self {
+            Hold::Locked => "for an unlock".into(),
+            Hold::Paused => "for the pause to end".into(),
+            Hold::Blocked => "for the block to end".into(),
+            Hold::Away => format!("for {}", rule.ssid.join(" or ")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +119,11 @@ pub struct Launch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Note {
     /// Became due, and waits to be clear.
-    Waiting { rule: RuleId, period: Period },
+    Waiting {
+        rule: RuleId,
+        period: Period,
+        hold: Hold,
+    },
     /// Was due, and its period closed first.
     Lapsed { rule: RuleId, period: Period },
     /// Was due, and has been skipped since.
@@ -148,6 +179,7 @@ pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
         let rs = state.rules.entry(id.clone()).or_default();
         if !rule.enabled {
             rs.due = None;
+            rs.hold = None;
             continue;
         }
 
@@ -179,21 +211,29 @@ pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
             }
         }
 
+        rs.hold = None;
         if let Some(p) = rs.due {
-            if is_clear(ctx, rule, obs) {
-                out.launches.push(Launch {
-                    rule: id.clone(),
-                    period: p,
-                    command: rule.command.clone(),
-                });
-                rs.ran = Some(p.start);
-                rs.ran_at = Some(now);
-                rs.due = None;
-            } else if newly {
-                out.notes.push(Note::Waiting {
-                    rule: id.clone(),
-                    period: p,
-                });
+            match hold(ctx, rule, obs) {
+                None => {
+                    out.launches.push(Launch {
+                        rule: id.clone(),
+                        period: p,
+                        command: rule.command.clone(),
+                    });
+                    rs.ran = Some(p.start);
+                    rs.ran_at = Some(now);
+                    rs.due = None;
+                }
+                Some(h) => {
+                    if newly {
+                        out.notes.push(Note::Waiting {
+                            rule: id.clone(),
+                            period: p,
+                            hold: h,
+                        });
+                    }
+                    rs.hold = Some(h);
+                }
             }
         }
     }
@@ -227,10 +267,21 @@ fn listens(rule: &Rule, fired: &[EventKind], arrived: Option<&str>) -> bool {
     })
 }
 
-fn is_clear(ctx: &Context, rule: &Rule, obs: &Observation) -> bool {
-    !(rule.unlocked && obs.locked)
-        && ctx.pause.is_none_or(|until| obs.now >= until)
-        && !ctx.overrides.blocks(&rule.id, obs.now)
+/// What keeps a due rule from running now, if anything.
+fn hold(ctx: &Context, rule: &Rule, obs: &Observation) -> Option<Hold> {
+    if rule.unlocked && obs.locked {
+        return Some(Hold::Locked);
+    }
+    if ctx.pause.is_some_and(|until| obs.now < until) {
+        return Some(Hold::Paused);
+    }
+    if ctx.overrides.blocks(&rule.id, obs.now) {
+        return Some(Hold::Blocked);
+    }
+    if !rule.ssid.is_empty() && !obs.ssid.as_ref().is_some_and(|s| rule.ssid.contains(s)) {
+        return Some(Hold::Away);
+    }
+    None
 }
 
 /// The next moment after `now` at which [`step`] could decide differently
@@ -379,7 +430,14 @@ mod tests {
         let mut w = world(REVIEW);
         w.locked = true;
         assert!(w.tick(TUE, 10, 0).is_empty());
-        assert!(matches!(w.notes[..], [Note::Waiting { .. }]));
+        assert!(matches!(
+            w.notes[..],
+            [Note::Waiting {
+                hold: Hold::Locked,
+                ..
+            }]
+        ));
+        assert_eq!(w.state.rules["review"].hold, Some(Hold::Locked));
         assert!(w.at(TUE, 10, 5, WAKE).is_empty());
         w.locked = false;
         assert_eq!(w.at(TUE, 10, 5, UNLOCK), ["review"]);
@@ -637,6 +695,35 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_rule_with_ssid_runs_only_there() {
+        let mut w = world(
+            r#"
+            [rule.reminder]
+            at = "17:30"
+            until = "20:00"
+            ssid = ["Office"]
+            run = ["remind"]
+            [rule.mount]
+            on = ["login"]
+            ssid = ["Office"]
+            run = ["mount"]
+            "#,
+        );
+        w.on(Some("Home"));
+        assert!(w.at(TUE, 9, 0, session("s1")).is_empty());
+        assert_eq!(w.state.rules["mount"].hold, Some(Hold::Away));
+        assert!(w.tick(TUE, 17, 30).is_empty());
+        assert_eq!(w.state.rules["reminder"].hold, Some(Hold::Away));
+        // Held, like an event behind a lock screen: run on getting there,
+        // if the period is still open -- and not while the Wi-Fi is down.
+        w.on(None);
+        assert!(w.at(TUE, 18, 0, NETWORK).is_empty());
+        w.on(Some("Office"));
+        assert_eq!(w.at(TUE, 18, 1, NETWORK), ["mount", "reminder"]);
+        assert_eq!(w.state.rules["reminder"].hold, None);
     }
 
     #[test]
