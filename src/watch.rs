@@ -22,9 +22,18 @@ pub struct NetState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     Locked,
-    Unlocked,
-    Woke,
-    Network { ssid: Option<String> },
+    /// `since` is when the session was last in use -- unlocked and awake --
+    /// before the lock, if the watch saw it.
+    Unlocked {
+        since: Option<Timestamp>,
+    },
+    /// `since` as for `Unlocked`, before the sleep.
+    Woke {
+        since: Option<Timestamp>,
+    },
+    Network {
+        ssid: Option<String>,
+    },
 }
 
 pub struct Sample {
@@ -50,8 +59,13 @@ const STALL_SECS: i64 = 90;
 pub struct Watch {
     last: Option<(Timestamp, Duration)>,
     locked: Option<bool>,
+    /// The last sample that found the session unlocked.
+    present: Option<Timestamp>,
     net: Option<NetState>,
     pending: Option<(NetState, u32)>,
+    /// Woken, and the network not settled since: what was known before the
+    /// sleep may be somewhere else's.
+    unsure: bool,
 }
 
 impl Watch {
@@ -59,7 +73,12 @@ impl Watch {
         self.locked.unwrap_or(true)
     }
 
+    /// The Wi-Fi network the network settled on, or none while it is
+    /// settling again after a wake.
     pub fn ssid(&self) -> Option<String> {
+        if self.unsure {
+            return None;
+        }
         self.net.as_ref().and_then(|n| n.ssid.clone())
     }
 
@@ -71,7 +90,11 @@ impl Watch {
             let walked = s.wall.as_second() - wall.as_second();
             let ticked = s.mono.saturating_sub(mono).as_secs() as i64;
             if walked - ticked > GAP_SECS || walked > STALL_SECS {
-                out.push(Change::Woke);
+                out.push(Change::Woke {
+                    since: self.present,
+                });
+                self.unsure = true;
+                self.pending = None;
             }
         }
         self.last = Some((s.wall, s.mono));
@@ -82,28 +105,39 @@ impl Watch {
             out.push(if s.locked {
                 Change::Locked
             } else {
-                Change::Unlocked
+                Change::Unlocked {
+                    since: self.present,
+                }
             });
         }
         self.locked = Some(s.locked);
+        if !s.locked {
+            self.present = Some(s.wall);
+        }
 
-        match &self.net {
-            None => self.net = Some(s.net),
-            Some(cur) if *cur == s.net => self.pending = None,
-            Some(_) => {
-                let n = match &self.pending {
-                    Some((p, n)) if *p == s.net => n + 1,
-                    _ => 1,
-                };
-                if n >= SETTLE {
+        // After a wake even the network it had settled on has to settle
+        // again before it is known; only a different one is a change.
+        let same = self.net.as_ref() == Some(&s.net);
+        if self.net.is_none() {
+            self.net = Some(s.net);
+        } else if same && !self.unsure {
+            self.pending = None;
+        } else {
+            let n = match &self.pending {
+                Some((p, n)) if *p == s.net => n + 1,
+                _ => 1,
+            };
+            if n >= SETTLE {
+                if !same {
                     out.push(Change::Network {
                         ssid: s.net.ssid.clone(),
                     });
                     self.net = Some(s.net);
-                    self.pending = None;
-                } else {
-                    self.pending = Some((s.net, n));
                 }
+                self.pending = None;
+                self.unsure = false;
+            } else {
+                self.pending = Some((s.net, n));
             }
         }
         out
@@ -166,7 +200,13 @@ mod tests {
         w.observe(c.sample(0, 0, false, &n));
         assert_eq!(w.observe(c.sample(2, 0, true, &n)), [Change::Locked]);
         assert!(w.observe(c.sample(2, 0, true, &n)).is_empty());
-        assert_eq!(w.observe(c.sample(2, 0, false, &n)), [Change::Unlocked]);
+        assert_eq!(
+            w.observe(c.sample(2, 0, false, &n)),
+            [Change::Unlocked {
+                since: Some(Timestamp::from_second(1_800_000_000).unwrap())
+            }],
+            "last in use at the sample before the lock"
+        );
     }
 
     #[test]
@@ -178,12 +218,23 @@ mod tests {
         };
         let n = net(None, &[]);
         w.observe(c.sample(0, 0, false, &n));
+        let used = Some(Timestamp::from_second(1_800_000_000).unwrap());
         // Lid closed: locked just before sleeping, woken an hour later.
         assert_eq!(w.observe(c.sample(2, 0, true, &n)), [Change::Locked]);
-        assert_eq!(w.observe(c.sample(2, 3600, true, &n)), [Change::Woke]);
-        assert_eq!(w.observe(c.sample(2, 0, false, &n)), [Change::Unlocked]);
+        assert_eq!(
+            w.observe(c.sample(2, 3600, true, &n)),
+            [Change::Woke { since: used }]
+        );
+        assert_eq!(
+            w.observe(c.sample(2, 0, false, &n)),
+            [Change::Unlocked { since: used }]
+        );
         // A clock that keeps counting through sleep shows it as a stall.
-        assert_eq!(w.observe(c.sample(600, 0, false, &n)), [Change::Woke]);
+        let before = Some(Timestamp::from_second(c.wall).unwrap());
+        assert_eq!(
+            w.observe(c.sample(600, 0, false, &n)),
+            [Change::Woke { since: before }]
+        );
         // An ordinary late sample is neither.
         assert!(w.observe(c.sample(5, 0, false, &n)).is_empty());
     }
@@ -226,5 +277,43 @@ mod tests {
                 ssid: Some("Office".into())
             }]
         );
+    }
+
+    #[test]
+    fn after_a_wake_the_network_is_unknown_until_it_settles_again() {
+        let mut w = Watch::default();
+        let mut c = Clock {
+            wall: 1_800_000_000,
+            mono: 0,
+        };
+        let home = net(Some("Home"), &["en0 10.0.0.2"]);
+        let office = net(Some("Office"), &["en0 172.16.0.9"]);
+        w.observe(c.sample(0, 0, true, &home));
+        // Asleep at home, woken somewhere else: Home is no longer known,
+        // whatever the first samples still say.
+        assert!(matches!(
+            w.observe(c.sample(2, 3600, true, &home))[..],
+            [Change::Woke { .. }]
+        ));
+        assert_eq!(w.ssid(), None);
+        assert!(w.observe(c.sample(2, 0, true, &office)).is_empty());
+        assert!(w.observe(c.sample(2, 0, true, &office)).is_empty());
+        assert_eq!(w.ssid(), None);
+        assert_eq!(
+            w.observe(c.sample(2, 0, true, &office)),
+            [Change::Network {
+                ssid: Some("Office".into())
+            }]
+        );
+        assert_eq!(w.ssid(), Some("Office".into()));
+        // Woken where it slept: known again once it holds, the wake's own
+        // sample counting, and no change.
+        w.observe(c.sample(2, 3600, true, &office));
+        for _ in 2..SETTLE {
+            assert!(w.observe(c.sample(2, 0, true, &office)).is_empty());
+            assert_eq!(w.ssid(), None);
+        }
+        assert!(w.observe(c.sample(2, 0, true, &office)).is_empty());
+        assert_eq!(w.ssid(), Some("Office".into()));
     }
 }

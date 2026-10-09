@@ -25,6 +25,8 @@ use crate::watch::{Change, Sample, Watch};
 const HEARTBEAT_SECS: i64 = 30;
 /// Where a log that has grown past this is moved aside.
 const LOG_LIMIT: u64 = 1 << 20;
+/// An event, and for one fired as `network NAME`, the network it names.
+type Heard = (Option<Event>, Option<String>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuAction {
@@ -68,6 +70,9 @@ pub struct Agent {
     last_beat: Option<Timestamp>,
     /// The start, kept for when there is a configuration to hear it.
     start: Option<Event>,
+    /// The network `shiodoki fire network NAME` named, and the one the
+    /// watch said then: it stands until the watch says otherwise.
+    pretend: Option<(String, Option<String>)>,
     /// Asked to stop, by `shiodoki uninstall`.
     quit: bool,
     /// Rules `shiodoki try --agent` asked to run now, with its token.
@@ -90,6 +95,7 @@ impl Agent {
             watch: Watch::default(),
             last_beat: None,
             start: None,
+            pretend: None,
             quit: false,
             tries: vec![],
         };
@@ -118,37 +124,39 @@ impl Agent {
         ));
         self.reload(now);
         self.watch.observe(s);
-        let ssid = self.watch.ssid();
-        self.decide(now, vec![Some(Event::Start { session, ssid })])
+        self.decide(now, vec![(Some(Event::Start { session }), None)])
     }
 
     pub fn tick(&mut self, s: Sample) -> Vec<Launch> {
         let now = s.wall;
         self.reload(now);
-        let mut events = vec![];
+        let mut events: Vec<Heard> = vec![];
         for c in self.watch.observe(s) {
-            self.log(&format!("{c:?}").to_lowercase());
-            events.push(match c {
-                Change::Locked => None,
-                Change::Unlocked => Some(Event::Unlock),
-                Change::Woke => Some(Event::Wake),
-                Change::Network { ssid } => Some(Event::Network { ssid }),
-            });
+            self.log(&said(&c));
+            events.push((
+                match c {
+                    Change::Locked => None,
+                    Change::Unlocked { since } => Some(Event::Unlock { since }),
+                    Change::Woke { since } => Some(Event::Wake { since }),
+                    Change::Network { .. } => Some(Event::Network),
+                },
+                None,
+            ));
         }
-        events.extend(self.inbox().into_iter().map(Some));
+        events.extend(self.inbox().into_iter().map(|(e, ssid)| (Some(e), ssid)));
         if events.is_empty() {
-            events.push(None);
+            events.push((None, None));
         }
         self.decide(now, events)
     }
 
-    fn decide(&mut self, now: Timestamp, mut events: Vec<Option<Event>>) -> Vec<Launch> {
+    fn decide(&mut self, now: Timestamp, mut events: Vec<Heard>) -> Vec<Launch> {
         let Some(config) = &self.config else {
             // Without rules nothing can be decided, but a login has to be
             // remembered until there are some: it will not come again.
             if let Some(start) = events
                 .into_iter()
-                .flatten()
+                .filter_map(|(e, _)| e)
                 .find(|e| matches!(e, Event::Start { .. }))
             {
                 self.start = Some(start);
@@ -157,7 +165,7 @@ impl Agent {
             return vec![];
         };
         if let Some(start) = self.start.take() {
-            events.insert(0, Some(start));
+            events.insert(0, (Some(start), None));
         }
         let ctx = Context {
             config,
@@ -168,10 +176,14 @@ impl Agent {
         let before = self.state.clone();
         let mut launches = vec![];
         let mut notes = vec![];
-        for event in events {
+        for (event, named) in events {
+            if let Some(name) = named {
+                self.pretend = Some((name, self.watch.ssid()));
+            }
             let obs = Observation {
                 now,
                 locked: self.watch.locked(),
+                ssid: pretended(&mut self.pretend, self.watch.ssid()),
                 event,
             };
             let out = engine::step(&ctx, &mut self.state, &obs);
@@ -183,6 +195,7 @@ impl Agent {
                 Note::Waiting { rule, .. } => format!("{rule} is due, and waits"),
                 Note::Lapsed { rule, .. } => format!("{rule} lapsed: its period closed first"),
                 Note::Skipped { rule, .. } => format!("{rule} was waiting, and is skipped"),
+                Note::Arrived { ssid } => format!("arrived on {ssid}"),
             };
             self.log(&line);
         }
@@ -247,8 +260,9 @@ impl Agent {
         }
     }
 
-    /// Events handed over by `shiodoki fire`, oldest first.
-    fn inbox(&mut self) -> Vec<Event> {
+    /// Events handed over by `shiodoki fire`, oldest first, each with the
+    /// network it names.
+    fn inbox(&mut self) -> Vec<(Event, Option<String>)> {
         let dir = self.paths.inbox();
         let Ok(entries) = fs::read_dir(&dir) else {
             return vec![];
@@ -268,7 +282,7 @@ impl Agent {
                 self.tries.push((id.to_string(), token.to_string()));
                 continue;
             }
-            match parse_fired(&text, self.watch.ssid()) {
+            match parse_fired(&text) {
                 Ok(e) => {
                     self.log(&format!("fired: {}", text.trim()));
                     out.push(e);
@@ -444,6 +458,32 @@ fn append(path: &Path, tz: &TimeZone, msg: &str) {
     }
 }
 
+/// The network now: the one a fired `network NAME` named, for as long as
+/// the watch says what it said then; otherwise the watch's.
+fn pretended(
+    pretend: &mut Option<(String, Option<String>)>,
+    real: Option<String>,
+) -> Option<String> {
+    match pretend {
+        Some((name, was)) if *was == real => Some(name.clone()),
+        _ => {
+            *pretend = None;
+            real
+        }
+    }
+}
+
+/// A change, as the log says it.
+fn said(c: &Change) -> String {
+    match c {
+        Change::Locked => "locked".into(),
+        Change::Unlocked { .. } => "unlocked".into(),
+        Change::Woke { .. } => "woke".into(),
+        Change::Network { ssid: Some(s) } => format!("network changed, on {s}"),
+        Change::Network { ssid: None } => "network changed, on no Wi-Fi".into(),
+    }
+}
+
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or_default().to_string()
 }
@@ -459,21 +499,21 @@ fn short(t: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
 }
 
 /// What `shiodoki fire` writes: `unlock`, `wake`, `login`, `network`, or
-/// `network NAME`.
-pub fn parse_fired(text: &str, ssid: Option<String>) -> Result<Event, String> {
+/// `network NAME`; with the network a `network NAME` names.
+pub fn parse_fired(text: &str) -> Result<(Event, Option<String>), String> {
     let mut words = text.split_whitespace();
     let event = match (words.next(), words.next()) {
-        (Some("unlock"), None) => Event::Unlock,
-        (Some("wake"), None) => Event::Wake,
-        (Some("login"), None) => Event::Start {
-            session: format!("fired-{}", Timestamp::now().as_millisecond()),
-            ssid,
-        },
+        (Some("unlock"), None) => (Event::Unlock { since: None }, None),
+        (Some("wake"), None) => (Event::Wake { since: None }, None),
+        (Some("login"), None) => (
+            Event::Start {
+                session: format!("fired-{}", Timestamp::now().as_millisecond()),
+            },
+            None,
+        ),
         (Some("network"), name) => {
             let rest: Vec<&str> = name.into_iter().chain(words).collect();
-            Event::Network {
-                ssid: (!rest.is_empty()).then(|| rest.join(" ")).or(ssid),
-            }
+            (Event::Network, (!rest.is_empty()).then(|| rest.join(" ")))
         }
         _ => return Err(format!("{:?} is not an event", text.trim())),
     };
@@ -661,6 +701,11 @@ mod tests {
         fs::write(inbox.join("3.event"), "lunch\n").unwrap();
         let s = t.sample(9, 1, 0, false);
         assert_eq!(T::ids(t.agent.tick(s)), ["u", "n"]);
+        // The network named stands while the real one stays as it was:
+        // the next tick does not arrive back on it.
+        let s = t.sample(9, 1, 1, false);
+        assert!(t.agent.tick(s).is_empty());
+        assert_eq!(t.log().matches("arrived on Office").count(), 1);
         assert!(!t.agent.wants_quit());
         fs::write(inbox.join("4.event"), "quit\n").unwrap();
         let s = t.sample(9, 1, 2, false);
@@ -679,24 +724,20 @@ mod tests {
 
     #[test]
     fn fired_words() {
-        assert_eq!(parse_fired("unlock", None), Ok(Event::Unlock));
         assert_eq!(
-            parse_fired("network", Some("Home".into())),
-            Ok(Event::Network {
-                ssid: Some("Home".into())
-            })
+            parse_fired("unlock"),
+            Ok((Event::Unlock { since: None }, None))
         );
+        assert_eq!(parse_fired("network"), Ok((Event::Network, None)));
         assert_eq!(
-            parse_fired("network My Office", None),
-            Ok(Event::Network {
-                ssid: Some("My Office".into())
-            })
+            parse_fired("network My Office"),
+            Ok((Event::Network, Some("My Office".into())))
         );
         assert!(matches!(
-            parse_fired("login", None),
-            Ok(Event::Start { .. })
+            parse_fired("login"),
+            Ok((Event::Start { .. }, None))
         ));
-        assert!(parse_fired("unlock now", None).is_err());
-        assert!(parse_fired("", None).is_err());
+        assert!(parse_fired("unlock now").is_err());
+        assert!(parse_fired("").is_err());
     }
 }

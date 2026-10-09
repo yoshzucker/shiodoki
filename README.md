@@ -79,7 +79,7 @@ every = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
 until = "12:00"
 run   = ["emacsclient", "-c", "-e", "(org-capture nil \"t\")"]
 
-# Event: joining one Wi-Fi network (Windows, for now).  Runs behind a
+# Event: arriving on one Wi-Fi network (Windows, for now).  Runs behind a
 # locked screen too.
 [rule.office-share]
 on       = ["network"]
@@ -101,7 +101,7 @@ it.
 | `until` | When a period closes: a time of day (`"10:20"`) or a length (`"20m"`, `"2h"`). A time earlier than `at` is on the next day | the end of the day |
 | `on` | The events that make the rule due: `login`, `unlock`, `wake`, `network`. Without `on` the rule is timed | -- |
 | `once` | For an event rule: run at most once a period, instead of on every event | `false` |
-| `ssid` | With `network`: the Wi-Fi network names to fire on | any change |
+| `ssid` | With `network`: the Wi-Fi networks to arrive on -- see [Networks](#networks) | any change |
 | `unlocked` | Wait for an unlocked session before running | `true` |
 | `except` | Dates the rule never runs on, such as holidays | `[]` |
 | `enabled` | `false` keeps a rule in the file without it running | `true` |
@@ -143,11 +143,29 @@ calendar's `DTSTART`, `from` is an occurrence only if the rule matches it.
 | `login` | The agent starting in a session it has not seen before. A session is known by its logon time, so the agent restarting in the same session -- after a crash, or a Quit and relaunch -- is not a login |
 | `unlock` | The screen unlocked, or the session switched back to with fast user switching |
 | `wake` | The system resumed from sleep. Usually a lock screen follows, and with `unlocked = true` the rule waits for it anyway, so `wake` on its own mostly matters when the machine woke without locking |
-| `network` | The network settled into a different state: a Wi-Fi network joined, a cable plugged in, a tethered phone appearing. Bursts of changes are given a few seconds to settle first. With `ssid`, only moving onto one of those networks from another or from none -- another adapter coming up while the Wi-Fi stays the same is not joining it again. A login starts with no network known, so the one already joined counts |
+| `network` | The network settled into a different state: a Wi-Fi network joined, a cable plugged in, a tethered phone appearing. Bursts of changes are given a few seconds to settle first. With `ssid`, arriving on one of those networks -- see [Networks](#networks) |
 
 An event that arrives while the rule cannot run -- the screen locked, a
 pause -- is held, not dropped: the rule is due, and runs when it is clear,
 if its period is still open. Several events held for one rule run it once.
+
+### Networks
+
+With `network` in `on`, `ssid` says which network events the rule hears:
+**arriving** on one of those networks from a different one. Time with no
+Wi-Fi in between -- asleep, reconnecting, on the way with the lid closed --
+is not leaving: back on the network it was on, the machine has not arrived
+anywhere. Another adapter coming up while the Wi-Fi stays the same is not
+arriving either.
+
+A login starts with no network known, so the one the machine is on counts
+as arrived on. So does coming back to it on a new day: a wake or an unlock,
+when it was last in use before the day started. A machine that slept
+through the night arrives in the morning wherever it wakes; one worked on
+past `day_starts` without a break does not.
+
+A wake leaves the network unknown until it has settled again, because the
+machine may have woken somewhere else: only then can it arrive anywhere.
 
 ### Time
 
@@ -242,7 +260,7 @@ minimal one. Give full paths, or set `PATH` and anything else under `[env]`.
 | Command | What it does |
 |---|---|
 | `shiodoki-agent [--config PATH]` | The resident process: the icon, the events and the clock. What the login item starts. A second one in the same state directory stops at once |
-| `shiodoki status` | Whether the agent is running or paused, which rules are due and waiting, and the next periods with skips and blocks applied |
+| `shiodoki status` | Whether the agent is running or paused, the network it last arrived on, which rules are due and waiting, and the next periods with skips and blocks applied |
 | `shiodoki pause` / `resume` | See [Holding back](#holding-back) |
 | `shiodoki skip` / `unskip` | See [Holding back](#holding-back) |
 | `shiodoki block` / `unblock` | See [Holding back](#holding-back) |
@@ -250,7 +268,7 @@ minimal one. Give full paths, or set `PATH` and anything else under `[env]`.
 | `shiodoki check` | Read the configuration and report what is wrong with it, without the agent |
 | `shiodoki try ID` | Run a rule's command now, ignoring its schedule, to see that it works. It runs in the foreground, with its output in the terminal, and `try` waits for it to exit |
 | `shiodoki try --agent ID` | Have the running agent run it now -- whatever the schedule, the lock or a pause -- and report what the agent's log says: how the command exited, or that it was handed to the OS. This is the whole way from the login item to the command, in the environment the agent really has, which is not your shell's |
-| `shiodoki fire EVENT [--ssid NAME]` | Hand the running agent an event as if the OS had sent it: `login` (as a new session), `unlock`, `wake`, `network`. It is refused when no agent is running, rather than kept for one that starts later |
+| `shiodoki fire EVENT [--ssid NAME]` | Hand the running agent an event as if the OS had sent it: `login` (as a new session), `unlock`, `wake`, `network`. With `--ssid`, the agent takes the machine to be on that network until the real one changes. It is refused when no agent is running, rather than kept for one that starts later |
 | `shiodoki install` / `uninstall` | Add the login item and start the agent, or remove it and stop the agent |
 
 The agent is a program of its own rather than a `shiodoki` subcommand
@@ -262,6 +280,7 @@ to; the agent must not open one at every login.
 $ shiodoki status
 agent    running (seen Tue 10-13 10:05)
 pause    not paused
+network  Example-Office, arrived Tue 10-13 09:40
 waiting  weekly-review    Tue 10-13 10:00-10:20
 next     Thu 10-15 15:00-15:15  retro  (skipped)
          Tue 10-20 10:00-10:20  weekly-review

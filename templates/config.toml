@@ -87,8 +87,10 @@
 #until = "12:00"
 #run   = ["emacsclient", "-c", "-e", "(org-capture nil \"t\")"]
 
-# Joining one Wi-Fi network (Windows only, for now), behind a locked screen
-# too.
+# Arriving on one Wi-Fi network (Windows only, for now), behind a locked
+# screen too.  Coming back to it after a stretch with no Wi-Fi -- a sleep, a
+# reconnect -- is not arriving; a login, or the first wake or unlock of a
+# new day, is.
 #[rule.office-share]
 #on       = ["network"]
 #ssid     = ["Example-Office"]

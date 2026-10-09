@@ -28,39 +28,42 @@ pub struct Context<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The agent started, in the session known by `session` (its logon
-    /// time, as the OS reports it), on the Wi-Fi network `ssid`.  A session
-    /// not seen before is a login, and starts with no network known, so the
-    /// one already joined counts as joining it.
-    Start {
-        session: String,
-        ssid: Option<String>,
-    },
-    Unlock,
-    Wake,
-    /// The network settled into a different state; `ssid` is the Wi-Fi
-    /// network now joined, if any.
-    Network {
-        ssid: Option<String>,
-    },
+    /// time, as the OS reports it).  A session not seen before is a login,
+    /// and starts with no network known, so the one already joined counts
+    /// as arriving on it.
+    Start { session: String },
+    /// The screen unlocked.  `since` is when the session was last in use
+    /// before, if that is known.
+    Unlock { since: Option<Timestamp> },
+    /// The system resumed from sleep; `since` as for `Unlock`.
+    Wake { since: Option<Timestamp> },
+    /// The network settled into a different state.
+    Network,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observation {
     pub now: Timestamp,
     pub locked: bool,
+    /// The Wi-Fi network joined now, if one is and it is known.
+    pub ssid: Option<String>,
     /// `None` when nothing happened but the clock.
     pub event: Option<Event>,
 }
 
-/// This machine's record: the session, and per rule what ran and what is
-/// waiting.
+/// This machine's record: the session, the network, and per rule what ran
+/// and what is waiting.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// The Wi-Fi network last reported in this session.
+    /// The Wi-Fi network last joined.  A stretch without Wi-Fi does not
+    /// forget it: coming back onto it from none is not arriving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssid: Option<String>,
+    /// When it arrived on `ssid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrived: Option<Timestamp>,
     #[serde(default)]
     pub rules: BTreeMap<RuleId, RuleState>,
 }
@@ -94,6 +97,8 @@ pub enum Note {
     Lapsed { rule: RuleId, period: Period },
     /// Was due, and has been skipped since.
     Skipped { rule: RuleId, period: Period },
+    /// Joined a Wi-Fi network other than the one last joined.
+    Arrived { ssid: String },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -105,33 +110,40 @@ pub struct Outcome {
 pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
     let now = obs.now;
     let mut fired: Vec<EventKind> = vec![];
-    // The network joined, when this event is a change of Wi-Fi network.
-    let mut joined: Option<String> = None;
     match &obs.event {
-        Some(Event::Start { session, ssid }) => {
-            if state.session.as_deref() != Some(session.as_str()) {
-                state.session = Some(session.clone());
-                fired.push(EventKind::Login);
-                joined = ssid.clone();
-            }
-            state.ssid = ssid.clone();
+        Some(Event::Start { session }) if state.session.as_deref() != Some(session.as_str()) => {
+            state.session = Some(session.clone());
+            fired.push(EventKind::Login);
+            state.ssid = None;
+            state.arrived = None;
         }
-        Some(Event::Unlock) => fired.push(EventKind::Unlock),
-        Some(Event::Wake) => fired.push(EventKind::Wake),
-        Some(Event::Network { ssid }) => {
-            fired.push(EventKind::Network);
-            if *ssid != state.ssid {
-                joined = ssid.clone();
-            }
-            state.ssid = ssid.clone();
+        Some(Event::Unlock { since }) => {
+            fired.push(EventKind::Unlock);
+            come_back(ctx, state, *since, now);
         }
-        None => {}
+        Some(Event::Wake { since }) => {
+            fired.push(EventKind::Wake);
+            come_back(ctx, state, *since, now);
+        }
+        Some(Event::Network) => fired.push(EventKind::Network),
+        Some(Event::Start { .. }) | None => {}
+    }
+
+    let mut out = Outcome::default();
+    // Arriving: being on a network other than the one last joined.
+    let mut arrived: Option<&str> = None;
+    if let Some(ssid) = &obs.ssid
+        && state.ssid.as_ref() != Some(ssid)
+    {
+        state.ssid = Some(ssid.clone());
+        state.arrived = Some(now);
+        arrived = Some(ssid);
+        out.notes.push(Note::Arrived { ssid: ssid.clone() });
     }
 
     state
         .rules
         .retain(|id, _| ctx.config.rules.contains_key(id));
-    let mut out = Outcome::default();
     for (id, rule) in &ctx.config.rules {
         let rs = state.rules.entry(id.clone()).or_default();
         if !rule.enabled {
@@ -157,7 +169,7 @@ pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
 
         let mut newly = false;
         if rs.due.is_none()
-            && (rule.is_timed() || listens(rule, &fired, joined.as_deref()))
+            && (rule.is_timed() || listens(rule, &fired, arrived))
             && let Some(p) = rule.period_at(now, ctx.config.day_starts, ctx.tz)
         {
             let done = (rule.is_timed() || rule.once) && rs.ran == Some(p.start);
@@ -188,13 +200,28 @@ pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
     out
 }
 
+/// Coming back to the machine on a new day, after it was last in use on an
+/// earlier one, it knows no network, as after a login: the one it is on
+/// counts as arrived on.  Only a network arrived on before the absence is
+/// forgotten, so that a wake and the unlock after it arrive once.
+fn come_back(ctx: &Context, state: &mut State, since: Option<Timestamp>, now: Timestamp) {
+    let ds = ctx.config.day_starts;
+    if let Some(since) = since
+        && ds.day_of(since, ctx.tz) < ds.day_of(now, ctx.tz)
+        && state.arrived.is_none_or(|a| a <= since)
+    {
+        state.ssid = None;
+        state.arrived = None;
+    }
+}
+
 /// Whether what happened is something `rule` listens for.  A rule with
-/// `ssid` hears joining one of those networks, however it was learned; a
-/// rule without hears every network event, and nothing else as one.
-fn listens(rule: &Rule, fired: &[EventKind], joined: Option<&str>) -> bool {
+/// `ssid` hears `network` as arriving on one of those networks, however it
+/// was learned; a rule without hears every network event.
+fn listens(rule: &Rule, fired: &[EventKind], arrived: Option<&str>) -> bool {
     rule.on.iter().any(|k| match k {
         EventKind::Network if !rule.ssid.is_empty() => {
-            joined.is_some_and(|s| rule.ssid.iter().any(|x| x == s))
+            arrived.is_some_and(|s| rule.ssid.iter().any(|x| x == s))
         }
         k => fired.contains(k),
     })
@@ -238,13 +265,14 @@ mod tests {
     use crate::overrides::{Block, Skip};
     use jiff::civil::{Date, date};
 
-    /// A configuration, a clock and a lock, stepped by hand.
+    /// A configuration, a clock, a lock and a network, stepped by hand.
     struct World {
         config: Config,
         overrides: Overrides,
         pause: Option<Timestamp>,
         state: State,
         locked: bool,
+        ssid: Option<String>,
         tz: TimeZone,
         notes: Vec<Note>,
     }
@@ -257,6 +285,7 @@ mod tests {
             pause: None,
             state: State::default(),
             locked: false,
+            ssid: None,
             tz: TimeZone::fixed(jiff::tz::offset(9)),
             notes: vec![],
         }
@@ -272,6 +301,7 @@ mod tests {
             let obs = Observation {
                 now: self.ts(d, h, m),
                 locked: self.locked,
+                ssid: self.ssid.clone(),
                 event,
             };
             let ctx = Context {
@@ -283,6 +313,21 @@ mod tests {
             let out = step(&ctx, &mut self.state, &obs);
             self.notes.extend(out.notes);
             out.launches.into_iter().map(|l| l.rule).collect()
+        }
+
+        /// On `ssid`, or on no Wi-Fi.
+        fn on(&mut self, ssid: Option<&str>) {
+            self.ssid = ssid.map(str::to_string);
+        }
+
+        fn arrivals(&self) -> Vec<&str> {
+            self.notes
+                .iter()
+                .filter_map(|n| match n {
+                    Note::Arrived { ssid } => Some(ssid.as_str()),
+                    _ => None,
+                })
+                .collect()
         }
 
         fn tick(&mut self, d: Date, h: i8, m: i8) -> Vec<String> {
@@ -311,11 +356,12 @@ mod tests {
     const WED: Date = date(2026, 10, 14);
 
     fn session(s: &str) -> Option<Event> {
-        Some(Event::Start {
-            session: s.into(),
-            ssid: None,
-        })
+        Some(Event::Start { session: s.into() })
     }
+
+    const UNLOCK: Option<Event> = Some(Event::Unlock { since: None });
+    const WAKE: Option<Event> = Some(Event::Wake { since: None });
+    const NETWORK: Option<Event> = Some(Event::Network);
 
     #[test]
     fn a_timed_rule_runs_once_when_its_period_opens() {
@@ -323,7 +369,7 @@ mod tests {
         assert!(w.tick(TUE, 9, 59).is_empty());
         assert_eq!(w.tick(TUE, 10, 0), ["review"]);
         assert!(w.tick(TUE, 10, 1).is_empty());
-        assert!(w.at(TUE, 10, 2, Some(Event::Unlock)).is_empty());
+        assert!(w.at(TUE, 10, 2, UNLOCK).is_empty());
         assert!(w.tick(WED, 10, 0).is_empty());
     }
 
@@ -334,9 +380,9 @@ mod tests {
         w.locked = true;
         assert!(w.tick(TUE, 10, 0).is_empty());
         assert!(matches!(w.notes[..], [Note::Waiting { .. }]));
-        assert!(w.at(TUE, 10, 5, Some(Event::Wake)).is_empty());
+        assert!(w.at(TUE, 10, 5, WAKE).is_empty());
         w.locked = false;
-        assert_eq!(w.at(TUE, 10, 5, Some(Event::Unlock)), ["review"]);
+        assert_eq!(w.at(TUE, 10, 5, UNLOCK), ["review"]);
     }
 
     #[test]
@@ -345,7 +391,7 @@ mod tests {
         w.locked = true;
         w.tick(TUE, 10, 0);
         w.locked = false;
-        assert!(w.at(TUE, 10, 25, Some(Event::Unlock)).is_empty());
+        assert!(w.at(TUE, 10, 25, UNLOCK).is_empty());
         assert_eq!(w.lapsed(), ["review"]);
     }
 
@@ -408,7 +454,7 @@ mod tests {
             to: TUE,
         });
         w.locked = false;
-        assert!(w.at(TUE, 10, 5, Some(Event::Unlock)).is_empty());
+        assert!(w.at(TUE, 10, 5, UNLOCK).is_empty());
         assert!(matches!(w.notes.last(), Some(Note::Skipped { .. })));
         // Taking the skip back while the period is open makes it due again.
         w.overrides.skips.clear();
@@ -424,7 +470,7 @@ mod tests {
             "a restart is not a login"
         );
         assert_eq!(w.at(TUE, 18, 0, session("monday-1800")), ["mount"]);
-        assert!(w.at(TUE, 18, 5, Some(Event::Unlock)).is_empty());
+        assert!(w.at(TUE, 18, 5, UNLOCK).is_empty());
     }
 
     #[test]
@@ -439,31 +485,24 @@ mod tests {
             run = ["capture"]
             "#,
         );
-        assert_eq!(w.at(TUE, 8, 50, Some(Event::Unlock)), ["morning"]);
-        assert!(w.at(TUE, 9, 30, Some(Event::Unlock)).is_empty());
-        assert!(w.at(TUE, 9, 31, Some(Event::Wake)).is_empty());
+        assert_eq!(w.at(TUE, 8, 50, UNLOCK), ["morning"]);
+        assert!(w.at(TUE, 9, 30, UNLOCK).is_empty());
+        assert!(w.at(TUE, 9, 31, WAKE).is_empty());
         // Past midnight but before the day starts: still Tuesday's, done.
-        assert!(w.at(WED, 2, 0, Some(Event::Unlock)).is_empty());
+        assert!(w.at(WED, 2, 0, UNLOCK).is_empty());
+        assert!(w.at(WED, 12, 30, UNLOCK).is_empty(), "after until");
         assert!(
-            w.at(WED, 12, 30, Some(Event::Unlock)).is_empty(),
-            "after until"
-        );
-        assert!(
-            w.at(date(2026, 10, 17), 9, 0, Some(Event::Unlock))
-                .is_empty(),
+            w.at(date(2026, 10, 17), 9, 0, UNLOCK).is_empty(),
             "Saturday"
         );
-        assert_eq!(
-            w.at(date(2026, 10, 15), 9, 0, Some(Event::Wake)),
-            ["morning"]
-        );
+        assert_eq!(w.at(date(2026, 10, 15), 9, 0, WAKE), ["morning"]);
     }
 
     #[test]
     fn without_once_every_event_runs() {
         let mut w = world("[rule.u]\non = [\"unlock\"]\nrun = [\"x\"]");
-        assert_eq!(w.at(TUE, 9, 0, Some(Event::Unlock)), ["u"]);
-        assert_eq!(w.at(TUE, 9, 30, Some(Event::Unlock)), ["u"]);
+        assert_eq!(w.at(TUE, 9, 0, UNLOCK), ["u"]);
+        assert_eq!(w.at(TUE, 9, 30, UNLOCK), ["u"]);
         assert!(w.tick(TUE, 9, 31).is_empty());
     }
 
@@ -471,16 +510,16 @@ mod tests {
     fn an_event_behind_the_lock_screen_waits_for_it() {
         let mut w = world("[rule.w]\non = [\"wake\"]\nrun = [\"x\"]");
         w.locked = true;
-        assert!(w.at(TUE, 9, 0, Some(Event::Wake)).is_empty());
-        assert!(w.at(TUE, 9, 0, Some(Event::Wake)).is_empty());
+        assert!(w.at(TUE, 9, 0, WAKE).is_empty());
+        assert!(w.at(TUE, 9, 0, WAKE).is_empty());
         w.locked = false;
         // Two wakes held, one run.
-        assert_eq!(w.at(TUE, 9, 1, Some(Event::Unlock)), ["w"]);
+        assert_eq!(w.at(TUE, 9, 1, UNLOCK), ["w"]);
         assert!(w.tick(TUE, 9, 2).is_empty());
     }
 
     #[test]
-    fn joining_a_network() {
+    fn arriving_is_coming_from_another_network() {
         let mut w = world(
             r#"
             [rule.share]
@@ -493,47 +532,111 @@ mod tests {
             run = ["x"]
             "#,
         );
-        let net = |s: Option<&str>| {
-            Some(Event::Network {
-                ssid: s.map(str::to_string),
-            })
-        };
         w.locked = true;
-        w.at(TUE, 8, 0, session("s1"));
+        w.on(Some("Home"));
+        assert!(w.at(TUE, 8, 0, session("s1")).is_empty());
+        assert_eq!(w.arrivals(), ["Home"], "a login knows no network");
+        w.on(Some("Office"));
         assert_eq!(
-            w.at(TUE, 8, 1, net(Some("Office"))),
+            w.at(TUE, 8, 1, NETWORK),
             ["share"],
             "behind the lock screen, and only share"
         );
         w.locked = false;
         assert_eq!(
-            w.at(TUE, 8, 30, net(Some("Office"))),
+            w.at(TUE, 8, 30, NETWORK),
             ["any"],
-            "another adapter coming up is not joining again"
+            "another adapter coming up is not arriving again"
         );
-        assert_eq!(w.at(TUE, 12, 0, net(None)), ["any"]);
-        assert_eq!(w.at(TUE, 13, 0, net(Some("Cafe"))), ["any"]);
-        let mut back = w.at(TUE, 14, 0, net(Some("Office")));
-        back.sort();
-        assert_eq!(back, ["any", "share"]);
+        // The Wi-Fi gone for a while -- a sleep, a reconnect -- and back:
+        // still where it was, not arriving.
+        w.on(None);
+        assert_eq!(w.at(TUE, 12, 0, NETWORK), ["any"]);
+        w.on(Some("Office"));
+        assert_eq!(w.at(TUE, 12, 5, NETWORK), ["any"]);
+        w.on(Some("Cafe"));
+        assert_eq!(w.at(TUE, 13, 0, NETWORK), ["any"]);
+        w.on(Some("Office"));
+        assert_eq!(w.at(TUE, 14, 0, NETWORK), ["any", "share"]);
         // A new session starts with no network known: being on it already
-        // is joining it, for the rules that name it and only those.
-        let start = |s: &str, ssid: &str| {
-            Some(Event::Start {
-                session: s.into(),
-                ssid: Some(ssid.into()),
-            })
-        };
-        assert_eq!(w.at(WED, 8, 0, start("s2", "Office")), ["share"]);
+        // is arriving on it, for the rules that name it and only those.
+        assert_eq!(w.at(WED, 8, 0, session("s2")), ["share"]);
         assert!(
-            w.at(WED, 8, 5, start("s2", "Office")).is_empty(),
-            "a restart is not joining"
+            w.at(WED, 8, 5, session("s2")).is_empty(),
+            "a restart is not arriving"
         );
+        w.on(Some("Cafe"));
+        assert!(w.at(WED, 9, 0, session("s3")).is_empty());
+        assert_eq!(w.state.ssid.as_deref(), Some("Cafe"));
+        assert_eq!(w.state.arrived, Some(w.ts(WED, 9, 0)));
+    }
+
+    #[test]
+    fn coming_back_on_a_new_day_is_arriving() {
+        let mut w = world(
+            r#"
+            [rule.home]
+            on = ["network"]
+            ssid = ["Home"]
+            run = ["connect"]
+            "#,
+        );
+        w.on(Some("Home"));
+        assert_eq!(w.at(TUE, 19, 0, session("s1")), ["home"]);
+        // Asleep from 23:00 to the morning: the wake knows no network until
+        // the agent has seen it settle, and then Home is arrived on.
+        w.on(None);
+        w.locked = true;
+        let night = Some(w.ts(TUE, 23, 0));
         assert!(
-            w.at(WED, 8, 6, net(Some("Office")))
-                .contains(&"any".to_string())
+            w.at(WED, 8, 0, Some(Event::Wake { since: night }))
+                .is_empty()
         );
-        assert_eq!(w.at(WED, 9, 0, start("s3", "Cafe")), Vec::<String>::new());
+        w.on(Some("Home"));
+        assert!(w.tick(WED, 8, 0).is_empty(), "behind the lock screen");
+        w.locked = false;
+        assert_eq!(
+            w.at(WED, 8, 1, Some(Event::Unlock { since: night })),
+            ["home"],
+            "and the unlock after the wake is not a second arrival"
+        );
+        assert_eq!(w.arrivals(), ["Home", "Home"]);
+        // A screen locked overnight, without sleep, is the same.
+        w.locked = true;
+        w.at(WED, 22, 0, None);
+        w.locked = false;
+        let evening = Some(w.ts(WED, 22, 0));
+        assert_eq!(
+            w.at(
+                date(2026, 10, 15),
+                7,
+                30,
+                Some(Event::Unlock { since: evening })
+            ),
+            ["home"]
+        );
+        // Away over lunch is not a new day, nor is a late night past
+        // midnight that the day has not ended for yet.
+        let lunch = Some(w.ts(date(2026, 10, 15), 12, 0));
+        assert!(
+            w.at(
+                date(2026, 10, 15),
+                13,
+                0,
+                Some(Event::Wake { since: lunch })
+            )
+            .is_empty()
+        );
+        let late = Some(w.ts(date(2026, 10, 15), 23, 50));
+        assert!(
+            w.at(
+                date(2026, 10, 16),
+                2,
+                0,
+                Some(Event::Unlock { since: late })
+            )
+            .is_empty()
+        );
     }
 
     #[test]

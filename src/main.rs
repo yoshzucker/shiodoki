@@ -91,7 +91,7 @@ enum Cmd {
     Fire {
         /// login, unlock, wake or network
         event: String,
-        /// With network: the Wi-Fi network joined
+        /// With network: the Wi-Fi network to be on, until the real one changes
         #[arg(long, value_name = "NAME")]
         ssid: Option<String>,
     },

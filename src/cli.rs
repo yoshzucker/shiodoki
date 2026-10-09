@@ -156,6 +156,12 @@ impl Cli {
             None => "not paused".to_string(),
         };
         let _ = writeln!(out, "pause    {pause}");
+        let network = match (&state.ssid, state.arrived) {
+            (Some(s), Some(t)) => format!("{s}, arrived {}", self.time(t)),
+            (Some(s), None) => s.clone(),
+            (None, _) => "none known".to_string(),
+        };
+        let _ = writeln!(out, "network  {network}");
 
         let waiting: Vec<(String, Period)> = state
             .rules
@@ -839,12 +845,18 @@ mod tests {
                 due: Some(p),
             },
         );
+        state.ssid = Some("Example-Office".into());
+        state.arrived = Some(local(date(2026, 10, 13).at(9, 40, 0, 0), &t.cli.tz));
         store::save_state(&t.cli.paths, &state).unwrap();
         store::write_heartbeat(&t.cli.paths, t.cli.now).unwrap();
         t.cli.skip("retro", Which::Next).unwrap();
         let s = t.cli.status().unwrap();
         assert!(s.contains("agent    running (seen Tue 10-13 10:05)"), "{s}");
         assert!(s.contains("pause    not paused"), "{s}");
+        assert!(
+            s.contains("network  Example-Office, arrived Tue 10-13 09:40"),
+            "{s}"
+        );
         assert!(s.contains("waiting  review   Tue 10-13 10:00-10:20"), "{s}");
         assert!(
             s.contains("next     Thu 10-15 15:00-15:15  retro  (skipped)"),
