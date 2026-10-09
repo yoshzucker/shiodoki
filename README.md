@@ -30,13 +30,14 @@ note, syncing a folder, mounting a share.
 - A rule becomes **due** when its period opens (a *timed* rule), or when an
   event it listens for arrives inside its period (an *event* rule).
 - A due rule **runs** at the first moment it is **clear**: the session is
-  unlocked, nothing pauses or blocks it, and -- for a rule that names
-  networks -- the machine is on one of them. If the period closes first, the
-  rule **lapses** for that period.
+  unlocked, nothing pauses or blocks it, and -- for a rule that asks for
+  them -- the machine is on one of its networks and its checks answer as it
+  needs. If the period closes first, the rule **lapses** for that period.
 
-Everything else follows from those four. Waiting for an unlock, giving up
-after a deadline, running once on the first login of the day: they are all a
-rule that is due, waiting to be clear, inside a period that ends.
+Everything else follows from those four. Waiting for an unlock or for a
+drive to be mapped, giving up after a deadline, running once on the first
+login of the day: they are all a rule that is due, waiting to be clear,
+inside a period that ends.
 
 ## A configuration
 
@@ -87,6 +88,22 @@ on       = ["network"]
 ssid     = ["Example-Office"]
 unlocked = false
 run      = ['C:\Windows\System32\net.exe', "use", "S:", '\\files.example.com\team']
+
+# Arriving home with the home drive not mapped: map it.  With it mapped
+# already, nothing -- unless it goes away while still at home.
+[rule.home-drive]
+on     = ["network"]
+ssid   = ["Example-Home"]
+unless = ['C:\Tools\drive-mapped.cmd']
+run    = ['C:\Windows\System32\net.exe', "use", "H:", '\\nas.example.com\home']
+
+# Arriving home, the photo sync as soon as the drive is there, however it
+# got there.
+[rule.photo-sync]
+on   = ["network"]
+ssid = ["Example-Home"]
+if   = ['C:\Tools\drive-mapped.cmd']
+run  = ['C:\Tools\sync-photos.cmd']
 ```
 
 ## Rules
@@ -104,6 +121,8 @@ it.
 | `once` | For an event rule: run at most once a period, instead of on every event | `false` |
 | `ssid` | The Wi-Fi networks the rule runs on; with `network`, arriving on one of them -- see [Networks](#networks) | any network |
 | `unlocked` | Wait for an unlocked session before running | `true` |
+| `if` | A command that has to succeed for the rule to run -- see [Checks](#checks) | -- |
+| `unless` | A command that has to fail for the rule to run | -- |
 | `except` | Dates the rule never runs on, such as holidays | `[]` |
 | `enabled` | `false` keeps a rule in the file without it running | `true` |
 | `run` / `open` / `with` | What to run -- see [Running things](#running-things) | -- |
@@ -173,6 +192,31 @@ past `day_starts` without a break does not.
 
 A wake leaves the network unknown until it has settled again, because the
 machine may have woken somewhere else. Until then a rule with `ssid` waits.
+
+### Checks
+
+`if` and `unless` are commands that say whether a rule can be of use yet:
+an `if` has to succeed -- exit with 0 -- and an `unless` to fail. A rule
+may have both. They are written as `run` is, with no shell.
+
+A check holds a due rule back as a lock does: the rule waits, and runs at
+the first moment its checks answer as it needs, if its period is still open.
+A check runs only for a rule that is due and otherwise clear -- unlocked, on
+its network, neither paused nor blocked -- and again every 10 seconds while
+that lasts. It runs hidden, with its output thrown away. One that takes
+longer than 10 seconds has given no answer, and the rule goes on waiting.
+Rules that share a check share each run of it.
+
+So a rule whose `unless` finds nothing to do keeps watching. Arriving home
+with the drive already mapped, the `home-drive` rule above waits for it to
+go away, for the rest of its period -- the day -- while the machine is home
+and unlocked, and runs the check every 10 seconds for that long. Keep a check
+that may run all day cheap: a registry value or a file, not a request over
+the network through a runtime that takes a second to start.
+
+The log says what a check answers whenever the answer changes, and
+`shiodoki status` what each waiting rule waits for. `shiodoki try ID` runs a
+rule's checks and says what they answered.
 
 ### Time
 
@@ -273,7 +317,7 @@ minimal one. Give full paths, or set `PATH` and anything else under `[env]`.
 | `shiodoki block` / `unblock` | See [Holding back](#holding-back) |
 | `shiodoki init` | Write the templates -- every setting there is, as commented examples -- where there is no `config.toml` or `overrides.toml` yet. It never writes over a file |
 | `shiodoki check` | Read the configuration and report what is wrong with it, without the agent |
-| `shiodoki try ID` | Run a rule's command now, ignoring its schedule, to see that it works. It runs in the foreground, with its output in the terminal, and `try` waits for it to exit |
+| `shiodoki try ID` | Run a rule's command now, ignoring its schedule, to see that it works. Its checks run first, to say what they answer, and the command runs whatever they say. Everything runs in the foreground, with its output in the terminal, and `try` waits for it to exit |
 | `shiodoki try --agent ID` | Have the running agent run it now -- whatever the schedule, the lock or a pause -- and report what the agent's log says: how the command exited, or that it was handed to the OS. This is the whole way from the login item to the command, in the environment the agent really has, which is not your shell's |
 | `shiodoki fire EVENT [--ssid NAME]` | Hand the running agent an event as if the OS had sent it: `login` (as a new session), `unlock`, `wake`, `network`. With `--ssid`, the agent takes the machine to be on that network until the real one changes. It is refused when no agent is running, rather than kept for one that starts later |
 | `shiodoki install` / `uninstall` | Add the login item and start the agent, or remove it and stop the agent |

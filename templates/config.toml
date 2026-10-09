@@ -112,6 +112,27 @@
 #open  = "https://hr.example.com/timesheet"
 
 
+# --- Checks ----------------------------------------------------------------
+#
+# `if` has to succeed and `unless` to fail for a rule to run.  A due rule
+# waits for them as it waits for an unlock, running them every 10 seconds
+# while it does.  They are written as `run` is.
+
+# Arriving home with the home drive not mapped: map it.
+#[rule.home-drive]
+#on     = ["network"]
+#ssid   = ["Example-Home"]
+#unless = ['C:\Tools\drive-mapped.cmd']
+#run    = ['C:\Windows\System32\net.exe', "use", "H:", '\\nas.example.com\home']
+
+# Arriving home: the photo sync, as soon as the drive is there.
+#[rule.photo-sync]
+#on   = ["network"]
+#ssid = ["Example-Home"]
+#if   = ['C:\Tools\drive-mapped.cmd']
+#run  = ['C:\Tools\sync-photos.cmd']
+
+
 # --- Running things --------------------------------------------------------
 #
 # `run` starts a program directly, with no shell: ask for one when you want

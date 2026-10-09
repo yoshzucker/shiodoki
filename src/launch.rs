@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::Command;
 
@@ -17,6 +18,8 @@ pub enum Output {
     Inherit,
     /// Appended to a log file: for the agent.
     Log(PathBuf),
+    /// Thrown away: for the checks the agent runs again and again.
+    Discard,
 }
 
 pub enum Started {
@@ -57,12 +60,51 @@ pub fn start(
     }
 }
 
+/// How long the command of an `if` or an `unless` may take before it counts
+/// as no answer.
+pub const CHECK_LIMIT: Duration = Duration::from_secs(10);
+
+/// Run the command of an `if` or an `unless`, with no window, and wait for
+/// it -- for at most `limit`: how it ended, or why there is no answer.
+pub fn check(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    out: &Output,
+    limit: Duration,
+) -> Result<ExitStatus, String> {
+    let mut c = std::process::Command::new(&argv[0]);
+    c.args(&argv[1..]);
+    no_console(&mut c, false);
+    let mut child = spawn_child(c, env, out, &argv[0])?;
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| format!("{}: {e}", argv[0]))? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no answer within {limit:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn spawn(
-    mut c: std::process::Command,
+    c: std::process::Command,
     env: &BTreeMap<String, String>,
     out: &Output,
     name: &str,
 ) -> Result<Started, String> {
+    spawn_child(c, env, out, name).map(Started::Child)
+}
+
+fn spawn_child(
+    mut c: std::process::Command,
+    env: &BTreeMap<String, String>,
+    out: &Output,
+    name: &str,
+) -> Result<Child, String> {
     c.envs(env).stdin(Stdio::null());
     // On Windows, HOME is whatever a POSIX shell such as MSYS2's set it to
     // -- `/home/you`, which Windows cannot start a process in.
@@ -70,18 +112,22 @@ fn spawn(
     if let Some(dir) = std::env::var_os(home).filter(|d| std::path::Path::new(d).is_dir()) {
         c.current_dir(dir);
     }
-    if let Output::Log(path) = out {
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let log2 = log.try_clone().map_err(|e| e.to_string())?;
-        c.stdout(log).stderr(log2);
+    match out {
+        Output::Inherit => {}
+        Output::Log(path) => {
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let log2 = log.try_clone().map_err(|e| e.to_string())?;
+            c.stdout(log).stderr(log2);
+        }
+        Output::Discard => {
+            c.stdout(Stdio::null()).stderr(Stdio::null());
+        }
     }
-    c.spawn()
-        .map(Started::Child)
-        .map_err(|e| format!("{name}: {e}"))
+    c.spawn().map_err(|e| format!("{name}: {e}"))
 }
 
 #[cfg(windows)]
@@ -377,6 +423,31 @@ mod tests {
         };
         assert_eq!(child.wait().unwrap().code(), Some(3));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "carried\noops\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_check_answers_with_its_exit_or_not_at_all() {
+        let sh = |script: &str| -> Vec<String> { vec!["sh".into(), "-c".into(), script.into()] };
+        let env = BTreeMap::from([("SHIODOKI_TEST".to_string(), "3".to_string())]);
+        let limit = Duration::from_secs(5);
+        let code = |argv: &[String]| check(argv, &env, &Output::Discard, limit).unwrap().code();
+        assert_eq!(code(&sh("echo noise; exit 0")), Some(0));
+        assert_eq!(code(&sh("exit $SHIODOKI_TEST")), Some(3));
+        let slow = check(
+            &sh("sleep 5"),
+            &env,
+            &Output::Discard,
+            Duration::from_millis(200),
+        );
+        assert_eq!(slow.unwrap_err(), "no answer within 200ms");
+        let missing = check(
+            &["/nonexistent/check".to_string()],
+            &env,
+            &Output::Discard,
+            limit,
+        );
+        assert!(missing.unwrap_err().starts_with("/nonexistent/check:"));
     }
 
     #[cfg(unix)]

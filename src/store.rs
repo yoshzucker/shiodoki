@@ -293,7 +293,7 @@ mod tests {
                 Config::parse(&uncommented(CONFIG_TEMPLATE), os).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(
                 all.rules.len(),
-                14,
+                16,
                 "{:?}",
                 all.rules.keys().collect::<Vec<_>>()
             );

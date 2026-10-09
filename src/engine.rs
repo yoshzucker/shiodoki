@@ -6,7 +6,7 @@
 //! last time, and runs whatever comes back.  That makes every rule of the
 //! README a test away.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -47,6 +47,9 @@ pub struct Observation {
     pub locked: bool,
     /// The Wi-Fi network joined now, if one is and it is known.
     pub ssid: Option<String>,
+    /// What the commands of `if` and `unless` answered lately: whether each
+    /// succeeded.  One missing has no answer yet.
+    pub answers: BTreeMap<Vec<String>, bool>,
     /// `None` when nothing happened but the clock.
     pub event: Option<Event>,
 }
@@ -94,6 +97,8 @@ pub enum Hold {
     Blocked,
     /// Not on one of its networks.
     Away,
+    If,
+    Unless,
 }
 
 impl Hold {
@@ -104,6 +109,8 @@ impl Hold {
             Hold::Paused => "for the pause to end".into(),
             Hold::Blocked => "for the block to end".into(),
             Hold::Away => format!("for {}", rule.ssid.join(" or ")),
+            Hold::If => "for its `if` to succeed".into(),
+            Hold::Unless => "for its `unless` to fail".into(),
         }
     }
 }
@@ -136,6 +143,10 @@ pub enum Note {
 pub struct Outcome {
     pub launches: Vec<Launch>,
     pub notes: Vec<Note>,
+    /// The commands of `if` and `unless` that due rules wait on and that
+    /// have no answer: the agent runs them, and answers in a later
+    /// observation.
+    pub asks: BTreeSet<Vec<String>>,
 }
 
 pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
@@ -213,7 +224,7 @@ pub fn step(ctx: &Context, state: &mut State, obs: &Observation) -> Outcome {
 
         rs.hold = None;
         if let Some(p) = rs.due {
-            match hold(ctx, rule, obs) {
+            match hold(ctx, rule, obs, &mut out.asks) {
                 None => {
                     out.launches.push(Launch {
                         rule: id.clone(),
@@ -267,8 +278,15 @@ fn listens(rule: &Rule, fired: &[EventKind], arrived: Option<&str>) -> bool {
     })
 }
 
-/// What keeps a due rule from running now, if anything.
-fn hold(ctx: &Context, rule: &Rule, obs: &Observation) -> Option<Hold> {
+/// What keeps a due rule from running now, if anything.  The checks come
+/// last, being the only thing that costs a process to learn; one without
+/// an answer is asked for.
+fn hold(
+    ctx: &Context,
+    rule: &Rule,
+    obs: &Observation,
+    asks: &mut BTreeSet<Vec<String>>,
+) -> Option<Hold> {
     if rule.unlocked && obs.locked {
         return Some(Hold::Locked);
     }
@@ -280,6 +298,17 @@ fn hold(ctx: &Context, rule: &Rule, obs: &Observation) -> Option<Hold> {
     }
     if !rule.ssid.is_empty() && !obs.ssid.as_ref().is_some_and(|s| rule.ssid.contains(s)) {
         return Some(Hold::Away);
+    }
+    for c in &rule.checks {
+        let hold = if c.unless { Hold::Unless } else { Hold::If };
+        match obs.answers.get(&c.argv) {
+            Some(&succeeded) if succeeded != c.unless => {}
+            Some(_) => return Some(hold),
+            None => {
+                asks.insert(c.argv.clone());
+                return Some(hold);
+            }
+        }
     }
     None
 }
@@ -316,7 +345,8 @@ mod tests {
     use crate::overrides::{Block, Skip};
     use jiff::civil::{Date, date};
 
-    /// A configuration, a clock, a lock and a network, stepped by hand.
+    /// A configuration, a clock, a lock, a network and the checks'
+    /// answers, stepped by hand.
     struct World {
         config: Config,
         overrides: Overrides,
@@ -324,6 +354,8 @@ mod tests {
         state: State,
         locked: bool,
         ssid: Option<String>,
+        answers: BTreeMap<Vec<String>, bool>,
+        asks: BTreeSet<Vec<String>>,
         tz: TimeZone,
         notes: Vec<Note>,
     }
@@ -337,6 +369,8 @@ mod tests {
             state: State::default(),
             locked: false,
             ssid: None,
+            answers: BTreeMap::new(),
+            asks: BTreeSet::new(),
             tz: TimeZone::fixed(jiff::tz::offset(9)),
             notes: vec![],
         }
@@ -353,6 +387,7 @@ mod tests {
                 now: self.ts(d, h, m),
                 locked: self.locked,
                 ssid: self.ssid.clone(),
+                answers: self.answers.clone(),
                 event,
             };
             let ctx = Context {
@@ -363,6 +398,7 @@ mod tests {
             };
             let out = step(&ctx, &mut self.state, &obs);
             self.notes.extend(out.notes);
+            self.asks = out.asks;
             out.launches.into_iter().map(|l| l.rule).collect()
         }
 
@@ -724,6 +760,58 @@ mod tests {
         w.on(Some("Office"));
         assert_eq!(w.at(TUE, 18, 1, NETWORK), ["mount", "reminder"]);
         assert_eq!(w.state.rules["reminder"].hold, None);
+    }
+
+    #[test]
+    fn checks_hold_a_rule_until_they_answer_as_it_needs() {
+        let mut w = world(
+            r#"
+            [rule.sync]
+            on = ["unlock"]
+            if = ["drive-mapped"]
+            run = ["sync"]
+            [rule.map]
+            on = ["unlock"]
+            unless = ["drive-mapped"]
+            run = ["map-drive"]
+            "#,
+        );
+        let mapped = vec!["drive-mapped".to_string()];
+        w.locked = true;
+        w.at(TUE, 9, 0, UNLOCK);
+        assert!(w.asks.is_empty(), "nothing is asked while it is locked");
+        w.locked = false;
+        assert!(w.at(TUE, 9, 1, UNLOCK).is_empty());
+        assert_eq!(w.asks, BTreeSet::from([mapped.clone()]), "one ask for both");
+        assert_eq!(w.state.rules["sync"].hold, Some(Hold::If));
+        assert_eq!(w.state.rules["map"].hold, Some(Hold::Unless));
+        // An answer stands until the agent lets it go; while it does, it is
+        // not asked for again.
+        w.answers.insert(mapped.clone(), false);
+        assert_eq!(w.tick(TUE, 9, 1), ["map"]);
+        assert!(w.asks.is_empty());
+        w.answers.clear();
+        assert!(w.tick(TUE, 9, 2).is_empty());
+        assert_eq!(w.asks, BTreeSet::from([mapped.clone()]));
+        w.answers.insert(mapped.clone(), true);
+        assert_eq!(w.tick(TUE, 9, 3), ["sync"]);
+        // Both on one rule: both have to hold.
+        let mut w =
+            world("[rule.r]\non = [\"unlock\"]\nif = [\"a\"]\nunless = [\"b\"]\nrun = [\"x\"]");
+        w.answers.insert(vec!["a".into()], true);
+        assert!(w.at(TUE, 9, 0, UNLOCK).is_empty());
+        assert_eq!(w.asks, BTreeSet::from([vec!["b".to_string()]]));
+        assert!(matches!(
+            w.notes[..],
+            [Note::Waiting {
+                hold: Hold::Unless,
+                ..
+            }]
+        ));
+        w.answers.insert(vec!["b".into()], true);
+        assert!(w.tick(TUE, 9, 1).is_empty());
+        w.answers.insert(vec!["b".into()], false);
+        assert_eq!(w.tick(TUE, 9, 2), ["r"]);
     }
 
     #[test]

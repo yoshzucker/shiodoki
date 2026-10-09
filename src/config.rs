@@ -59,6 +59,21 @@ pub enum Command {
     },
 }
 
+/// A command whose exit says whether a rule may run now: an `if` has to
+/// succeed, an `unless` to fail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Check {
+    pub argv: Vec<String>,
+    pub unless: bool,
+}
+
+impl Check {
+    /// The key it was given as.
+    pub fn key(&self) -> &'static str {
+        if self.unless { "unless" } else { "if" }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub id: RuleId,
@@ -71,6 +86,8 @@ pub struct Rule {
     /// The Wi-Fi networks the rule runs on; empty for any.
     pub ssid: Vec<String>,
     pub unlocked: bool,
+    /// `if`, then `unless`.
+    pub checks: Vec<Check>,
     pub except: Vec<Date>,
     pub enabled: bool,
     pub command: Command,
@@ -136,8 +153,8 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 const RULE_KEYS: &[&str] = &[
-    "every", "from", "at", "until", "on", "once", "ssid", "unlocked", "except", "enabled", "run",
-    "open", "with", "window",
+    "every", "from", "at", "until", "on", "once", "ssid", "unlocked", "if", "unless", "except",
+    "enabled", "run", "open", "with", "window",
 ];
 const COMMAND_KEYS: &[&str] = &["run", "open", "with", "window"];
 const OS_KEYS: &[&str] = &["macos", "windows"];
@@ -319,6 +336,15 @@ fn parse_rule(id: &str, value: &Value, os: Os) -> Result<Rule, Vec<String>> {
     if let Some(v) = get("unlocked") {
         field!("unlocked", boolean(&v).map(|b| unlocked = b));
     }
+    let mut checks = vec![];
+    for (key, unless) in [("if", false), ("unless", true)] {
+        if let Some(v) = get(key) {
+            field!(
+                key,
+                command_line(&v).map(|argv| checks.push(Check { argv, unless }))
+            );
+        }
+    }
     let mut except = vec![];
     if let Some(v) = get("except") {
         field!(
@@ -352,14 +378,7 @@ fn parse_rule(id: &str, value: &Value, os: Os) -> Result<Rule, Vec<String>> {
             }
             field!(
                 "run",
-                strings(&run).and_then(|argv| {
-                    if argv.is_empty() || argv[0].is_empty() {
-                        Err("expected a command and its arguments".into())
-                    } else {
-                        command = Some(Command::Run { argv, window });
-                        Ok(())
-                    }
-                }),
+                command_line(&run).map(|argv| command = Some(Command::Run { argv, window }))
             );
         }
         (None, Some(open)) => {
@@ -404,6 +423,7 @@ fn parse_rule(id: &str, value: &Value, os: Os) -> Result<Rule, Vec<String>> {
             once,
             ssid,
             unlocked,
+            checks,
             except,
             enabled,
             command,
@@ -430,6 +450,17 @@ fn strings(v: &Value) -> Result<Vec<String>, String> {
             .collect(),
         _ => Err("expected a list of strings".into()),
     }
+}
+
+/// A command and its arguments.
+fn command_line(v: &Value) -> Result<Vec<String>, String> {
+    strings(v).and_then(|argv| {
+        if argv.first().is_none_or(String::is_empty) {
+            Err("expected a command and its arguments".into())
+        } else {
+            Ok(argv)
+        }
+    })
 }
 
 /// `2026-10-08`, written either as a TOML date or as a string.
@@ -517,6 +548,10 @@ mod tests {
             let v = &c.rules["office-share"];
             assert_eq!(v.ssid, vec!["Example-Office".to_string()]);
             assert!(!v.unlocked);
+            let (map, sync) = (&c.rules["home-drive"], &c.rules["photo-sync"]);
+            assert_eq!(map.checks[0].key(), "unless");
+            assert_eq!(sync.checks[0].key(), "if");
+            assert_eq!(map.checks[0].argv, sync.checks[0].argv);
         }
     }
 
@@ -611,6 +646,10 @@ mod tests {
             surprise = 1
             [rule.d.linux]
             run = ["y"]
+            [rule.e]
+            if = []
+            unless = 3
+            run = ["x"]
             "#,
         );
         let has = |needle: &str| {
@@ -630,6 +669,45 @@ mod tests {
         has("rule.c.run");
         has("rule.d.surprise");
         has("rule.d.linux");
+        has("rule.e.if: expected a command");
+        has("rule.e.unless: expected a list of strings");
+    }
+
+    #[test]
+    fn checks_and_networks_on_any_rule() {
+        let text = r#"
+            [rule.r]
+            at = "17:30"
+            ssid = ["Example-Office"]
+            if = ["/usr/local/bin/drive-mapped"]
+            unless = "on-battery"
+            run = ["x"]
+            [rule.r.windows]
+            if = ['C:\tools\drive-mapped.exe']
+        "#;
+        let mac = Config::parse(text, Os::MacOS).unwrap_or_else(|e| panic!("{e}"));
+        let r = &mac.rules["r"];
+        assert!(r.is_timed());
+        assert_eq!(r.ssid, vec!["Example-Office".to_string()]);
+        assert_eq!(
+            r.checks,
+            vec![
+                Check {
+                    argv: vec!["/usr/local/bin/drive-mapped".into()],
+                    unless: false
+                },
+                Check {
+                    argv: vec!["on-battery".into()],
+                    unless: true
+                },
+            ]
+        );
+        let win = Config::parse(text, Os::Windows).unwrap();
+        assert_eq!(
+            win.rules["r"].checks[0].argv,
+            vec![r"C:\tools\drive-mapped.exe"]
+        );
+        assert_eq!(win.rules["r"].checks[1].key(), "unless");
     }
 
     #[test]

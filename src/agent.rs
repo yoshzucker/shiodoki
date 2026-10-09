@@ -5,10 +5,12 @@
 //! answers with what to run.  The program in `src/bin` does the asking, the
 //! running and the drawing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::SystemTime;
 
 use jiff::tz::TimeZone;
@@ -25,6 +27,10 @@ use crate::watch::{Change, Sample, Watch};
 const HEARTBEAT_SECS: i64 = 30;
 /// Where a log that has grown past this is moved aside.
 const LOG_LIMIT: u64 = 1 << 20;
+/// How long a check's answer stands, and how soon after one last started
+/// or ended it may be run again.
+const CHECK_EVERY_SECS: i64 = 10;
+
 /// An event, and for one fired as `network NAME`, the network it names.
 type Heard = (Option<Event>, Option<String>);
 
@@ -55,6 +61,35 @@ fn stamp(path: &Path) -> Stamp {
         .and_then(|m| Some((m.modified().ok()?, m.len())))
 }
 
+/// The commands of `if` and `unless`.  Each runs on a thread of its own,
+/// so that a slow one does not hold up the samples, and is answered in a
+/// later tick.
+struct Checks {
+    /// Each answer, and when it came.
+    answers: BTreeMap<Vec<String>, (bool, Timestamp)>,
+    running: BTreeSet<Vec<String>>,
+    /// When each last started or ended.
+    last: BTreeMap<Vec<String>, Timestamp>,
+    /// What each last said, so that the log says it once.
+    said: BTreeMap<Vec<String>, String>,
+    tx: Sender<(Vec<String>, Result<ExitStatus, String>)>,
+    rx: Receiver<(Vec<String>, Result<ExitStatus, String>)>,
+}
+
+impl Checks {
+    fn new() -> Checks {
+        let (tx, rx) = channel();
+        Checks {
+            answers: BTreeMap::new(),
+            running: BTreeSet::new(),
+            last: BTreeMap::new(),
+            said: BTreeMap::new(),
+            tx,
+            rx,
+        }
+    }
+}
+
 pub struct Agent {
     paths: Paths,
     os: Os,
@@ -73,6 +108,7 @@ pub struct Agent {
     /// The network `shiodoki fire network NAME` named, and the one the
     /// watch said then: it stands until the watch says otherwise.
     pretend: Option<(String, Option<String>)>,
+    checks: Checks,
     /// Asked to stop, by `shiodoki uninstall`.
     quit: bool,
     /// Rules `shiodoki try --agent` asked to run now, with its token.
@@ -96,6 +132,7 @@ impl Agent {
             last_beat: None,
             start: None,
             pretend: None,
+            checks: Checks::new(),
             quit: false,
             tries: vec![],
         };
@@ -151,6 +188,7 @@ impl Agent {
     }
 
     fn decide(&mut self, now: Timestamp, mut events: Vec<Heard>) -> Vec<Launch> {
+        self.collect(now);
         let Some(config) = &self.config else {
             // Without rules nothing can be decided, but a login has to be
             // remembered until there are some: it will not come again.
@@ -173,9 +211,16 @@ impl Agent {
             pause: self.pause,
             tz: &self.tz,
         };
+        let answers: BTreeMap<Vec<String>, bool> = self
+            .checks
+            .answers
+            .iter()
+            .map(|(argv, (ok, _))| (argv.clone(), *ok))
+            .collect();
         let before = self.state.clone();
         let mut launches = vec![];
         let mut notes = vec![];
+        let mut asks = BTreeSet::new();
         for (event, named) in events {
             if let Some(name) = named {
                 self.pretend = Some((name, self.watch.ssid()));
@@ -184,11 +229,13 @@ impl Agent {
                 now,
                 locked: self.watch.locked(),
                 ssid: pretended(&mut self.pretend, self.watch.ssid()),
+                answers: answers.clone(),
                 event,
             };
             let out = engine::step(&ctx, &mut self.state, &obs);
             launches.extend(out.launches);
             notes.extend(out.notes);
+            asks.extend(out.asks);
         }
         for n in notes {
             let line = match n {
@@ -202,13 +249,60 @@ impl Agent {
             };
             self.log(&line);
         }
+        let env = config.env.clone();
         if self.state != before
             && let Err(e) = store::save_state(&self.paths, &self.state)
         {
             self.log(&e);
         }
         self.beat(now);
+        self.ask(now, asks, &env);
         launches
+    }
+
+    /// Take in what the checks that have ended said, and let go of answers
+    /// too old to stand.
+    fn collect(&mut self, now: Timestamp) {
+        while let Ok((argv, ended)) = self.checks.rx.try_recv() {
+            self.checks.running.remove(&argv);
+            self.checks.last.insert(argv.clone(), now);
+            let said = match ended {
+                Ok(status) => {
+                    self.checks
+                        .answers
+                        .insert(argv.clone(), (status.success(), now));
+                    launch::ended(status)
+                }
+                Err(e) => e,
+            };
+            if self.checks.said.get(&argv) != Some(&said) {
+                self.log(&format!("check {}: {said}", argv.join(" ")));
+                self.checks.said.insert(argv, said);
+            }
+        }
+        self.checks.answers.retain(|_, (_, at)| {
+            (0..CHECK_EVERY_SECS).contains(&(now.as_second() - at.as_second()))
+        });
+    }
+
+    /// Start the checks asked for that are not running, and have not just
+    /// run: one that cannot answer is not tried again at once.
+    fn ask(&mut self, now: Timestamp, asks: BTreeSet<Vec<String>>, env: &BTreeMap<String, String>) {
+        for argv in asks {
+            let recent = self.checks.last.get(&argv).is_some_and(|t| {
+                (0..CHECK_EVERY_SECS).contains(&(now.as_second() - t.as_second()))
+            });
+            if self.checks.running.contains(&argv) || recent {
+                continue;
+            }
+            self.checks.running.insert(argv.clone());
+            self.checks.last.insert(argv.clone(), now);
+            let (tx, env) = (self.checks.tx.clone(), env.clone());
+            std::thread::spawn(move || {
+                let ended = launch::check(&argv, &env, &Output::Discard, launch::CHECK_LIMIT);
+                let _ = tx.send((argv, ended));
+            });
+        }
     }
 
     fn beat(&mut self, now: Timestamp) {
@@ -742,5 +836,65 @@ mod tests {
         ));
         assert!(parse_fired("unlock now").is_err());
         assert!(parse_fired("").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checks_run_on_their_own_and_answer_a_later_tick() {
+        let mut t = agent(
+            r#"
+            [rule.go]
+            on = ["login"]
+            if = ["sh", "-c", "exit 0"]
+            run = ["true"]
+            [rule.stay]
+            on = ["login"]
+            unless = ["sh", "-c", "exit 0"]
+            run = ["true"]
+            "#,
+        );
+        let s = t.sample(9, 0, 0, false);
+        assert!(t.agent.begin(s, "console-1".into()).is_empty());
+        let mut ran = vec![];
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(50));
+            let s = t.sample(9, 0, 1, false);
+            ran.extend(T::ids(t.agent.tick(s)));
+            if !ran.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(ran, ["go"]);
+        let log = t.log();
+        assert!(
+            log.contains("go is due, and waits for its `if` to succeed"),
+            "{log}"
+        );
+        assert!(
+            log.contains("stay is due, and waits for its `unless` to fail"),
+            "{log}"
+        );
+        assert_eq!(
+            log.matches("check sh -c exit 0: exit status: 0").count(),
+            1,
+            "one check for both rules, said once: {log}"
+        );
+        // The answer stands for a while; then it is asked again, and while
+        // it is the same the log does not repeat it.
+        let s = t.sample(9, 0, 5, false);
+        assert!(t.agent.tick(s).is_empty());
+        assert!(t.agent.checks.running.is_empty());
+        let s = t.sample(9, 0, 12, false);
+        assert!(t.agent.tick(s).is_empty());
+        assert!(!t.agent.checks.running.is_empty(), "asked again");
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(50));
+            let s = t.sample(9, 0, 13, false);
+            assert!(t.agent.tick(s).is_empty());
+            if t.agent.checks.running.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(t.log().matches("check sh -c exit 0").count(), 1);
     }
 }

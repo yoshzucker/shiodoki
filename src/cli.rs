@@ -118,6 +118,9 @@ impl Cli {
         if !rule.ssid.is_empty() {
             let _ = write!(s, "at {}; ", rule.ssid.join(", "));
         }
+        for c in &rule.checks {
+            let _ = write!(s, "{} {}; ", c.key(), c.argv.join(" "));
+        }
         match rule.period_at(self.now, ds, &self.tz) {
             Some(p) => {
                 let now = if rule.is_timed() {
@@ -565,13 +568,28 @@ impl Cli {
         Err(out)
     }
 
-    /// Run a rule's command now, in the foreground, whatever its schedule.
+    /// Run a rule's command now, in the foreground, whatever its schedule:
+    /// its checks first, to say what they answer, and then the command
+    /// whatever they said.
     pub fn try_rule(&self, id: &str) -> Result<String, String> {
         let config = self.config()?;
         let rule = self.rule(&config, id)?;
-        match launch::start(&rule.command, &config.env, &Output::Inherit)? {
-            Started::HandedOff => Ok(format!("{id}: handed to the OS\n")),
-            Started::Child(mut child) => {
+        let mut out = String::new();
+        for c in &rule.checks {
+            let said =
+                match launch::check(&c.argv, &config.env, &Output::Inherit, launch::CHECK_LIMIT) {
+                    Ok(status) if status.success() != c.unless => {
+                        format!("{}, so it may run", launch::ended(status))
+                    }
+                    Ok(status) => format!("{}, so it would wait", launch::ended(status)),
+                    Err(e) => format!("{e}, so it would wait"),
+                };
+            let _ = writeln!(out, "{id}: {} {}: {said}", c.key(), c.argv.join(" "));
+        }
+        match launch::start(&rule.command, &config.env, &Output::Inherit) {
+            Err(e) => Err(format!("{out}{e}")),
+            Ok(Started::HandedOff) => Ok(format!("{out}{id}: handed to the OS\n")),
+            Ok(Started::Child(mut child)) => {
                 let status = child.wait().map_err(|e| e.to_string())?;
                 let what = match &rule.command {
                     Command::Run { .. } => "exited",
@@ -579,9 +597,9 @@ impl Cli {
                 };
                 let how = launch::ended(status);
                 if status.success() {
-                    Ok(format!("{id}: {what} with {how}\n"))
+                    Ok(format!("{out}{id}: {what} with {how}\n"))
                 } else {
-                    Err(format!("{id}: {what} with {how}"))
+                    Err(format!("{out}{id}: {what} with {how}"))
                 }
             }
         }
@@ -622,6 +640,8 @@ mod tests {
         [rule.intranet]
         on = ["network"]
         ssid = ["Example-Home"]
+        if = ["sh", "-c", "exit 0"]
+        unless = ["sh", "-c", "exit 0"]
         run = ["sh", "-c", "exit 0"]
     "#;
 
@@ -661,7 +681,9 @@ mod tests {
         let out = t.cli.check().unwrap();
         assert!(out.contains("4 rules"), "{out}");
         assert!(
-            out.contains("intranet  on network; at Example-Home; listening now"),
+            out.contains(
+                "intranet  on network; at Example-Home; if sh -c exit 0; unless sh -c exit 0; listening now"
+            ),
             "{out}"
         );
         assert!(
@@ -979,6 +1001,12 @@ mod tests {
         assert_eq!(
             t.cli.try_rule("morning").unwrap_err(),
             "morning: exited with exit status: 4"
+        );
+        assert_eq!(
+            t.cli.try_rule("intranet").unwrap(),
+            "intranet: if sh -c exit 0: exit status: 0, so it may run\n\
+             intranet: unless sh -c exit 0: exit status: 0, so it would wait\n\
+             intranet: exited with exit status: 0\n"
         );
     }
 }
